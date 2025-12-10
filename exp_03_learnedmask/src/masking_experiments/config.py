@@ -16,15 +16,17 @@ class TaskConfig:
     column_index: int
     held_out: bool = False
     dataset_variant: str = "default"
+    dataset_name: str | None = None
     residual_from: str | None = None
     consolidate_into: str | None = None
 
 
 @dataclass
 class DatasetConfig:
-    """SplitMNIST dataset options."""
+    """Dataset options shared across MNIST/FashionMNIST pipelines."""
 
     root: str = "assets/data"
+    default_dataset: str = "mnist"
     held_out_fraction: float = 0.1
     max_train_samples: int | None = None
     use_fake_data: bool = False
@@ -111,6 +113,7 @@ def _load_task(raw: Dict[str, Any]) -> TaskConfig:
         column_index=raw["column_index"],
         held_out=raw.get("held_out", False),
         dataset_variant=raw.get("dataset_variant", "default"),
+        dataset_name=raw.get("dataset_name"),
         residual_from=raw.get("residual_from"),
         consolidate_into=raw.get("consolidate_into"),
     )

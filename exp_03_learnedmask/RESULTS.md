@@ -19,3 +19,11 @@ We extended the SplitMNIST SNN to learn soft column masks and to distil primed t
   - Error-overlap metrics remain high (≈40–80 %), showing the consolidated model reproduces the teacher’s behavior.
 
 Together these experiments demonstrate that soft allocation plus sleep consolidation preserves continual-learning performance while letting us re-use the same columns for both base and primed tasks.
+
+## Mixed MNIST + FashionMNIST Schedule
+- **Command:** `python -m scripts.run_experiment --config configs/stage4_sequential_mixed_soft_sleep.yaml`
+- **Highlights:**
+  - Four base tasks (two MNIST pairs, two FashionMNIST pairs) train sequentially twice, maintaining ≥95 % accuracy each time a new task arrives; deltas stay within ±5 % even before sleep.
+  - Soft masks naturally reuse columns—mnist_task1/fashion_task2 share a column while mnist_task2/fashion_task1 occupy their own—yet base-bank occupancy never exceeds 50 %, indicating ample unused capacity.
+  - Primed held-out tasks learn in their novel bank, then sleep distillation (label weight = 0, `held_out_replay=2`) consolidates them perfectly into their parent prompts with 100 % error-overlap.
+  - Final accuracies remain 99.8 % / 97.3 % / 98.7 % / 97.4 % for the four base tasks, showing continual learning holds even when mixing distinct datasets.

@@ -79,6 +79,19 @@ def _sleep_tasks():
     ]
 
 
+def _mixed_mnist_fashion_tasks():
+    return [
+        TaskConfig(name="Digits", prompt="Digits", column_index=0, dataset_variant="task1"),
+        TaskConfig(
+            name="Clothing",
+            prompt="Clothing",
+            column_index=1,
+            dataset_variant="fashion_task1",
+            dataset_name="fashion_mnist",
+        ),
+    ]
+
+
 def _make_config(experiment_type: str) -> ExperimentConfig:
     return ExperimentConfig(
         name=f"test_{experiment_type}",
@@ -341,3 +354,31 @@ def test_soft_column_sleep_reports_masks():
     after_stage = result.stages[-1]
     assert before_stage.mask_logs is not None and "_occupancy" in before_stage.mask_logs
     assert after_stage.mask_logs is not None and "_occupancy" in after_stage.mask_logs
+
+
+def test_mixed_mnist_and_fashion_tasks_run():
+    config = ExperimentConfig(
+        name="mnist_fashion_mix",
+        experiment_type="sequential",
+        tasks=_mixed_mnist_fashion_tasks(),
+        dataset=DatasetConfig(
+            root="tests/.fake_data",
+            held_out_fraction=0.1,
+            max_train_samples=64,
+            use_fake_data=True,
+            download=False,
+            default_dataset="mnist",
+        ),
+        training=TrainingConfig(
+            epochs=1,
+            batch_size=16,
+            base_learning_rate=0.01,
+            seed=37,
+            task_schedule=["Digits", "Clothing"],
+        ),
+        masking=MaskingConfig(learning_rate_scale=0.2, threshold_shift=0.3, prompt_vector_dim=8),
+        model=ModelConfig(hidden_per_column=16, time_steps=3, beta=0.9),
+    )
+    result = run_experiment(config)
+    assert result.stages[-1].label == "after_Clothing"
+    assert all(0.0 <= metric.accuracy <= 1.0 for metric in result.stages[-1].metrics)
