@@ -1,0 +1,43 @@
+name: stage4_parallel_soft
+experiment_type: parallel
+tasks:
+  - name: task1
+    prompt: task1
+    column_index: 0
+    dataset_variant: task1
+  - name: task2
+    prompt: task2
+    column_index: 1
+    dataset_variant: task2
+dataset:
+  root: assets/data
+  held_out_fraction: 0.1
+  max_train_samples: 4000
+  use_fake_data: false
+  download: true
+training:
+  epochs: 25
+  batch_size: 64
+  base_learning_rate: 0.02
+  seed: 17
+masking:
+  learning_rate_scale: 0.4
+  threshold_shift: 0.15
+  prompt_vector_dim: 16
+  mode: soft_columns
+  soft_columns:
+    total_columns: 8
+    base_columns: 8
+    base_tasks:
+      - task1
+      - task2
+    novel_tasks: []
+    temperature: 0.35
+    lambda_entropy: 0.01
+    lambda_balance: 0.02
+    lambda_overlap_novel: 0.0
+    mask_learning_rate: 0.05
+model:
+  hidden_per_column: 32
+  time_steps: 5
+  beta: 0.9

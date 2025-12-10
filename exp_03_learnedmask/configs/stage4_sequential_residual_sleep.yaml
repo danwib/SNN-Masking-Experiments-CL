@@ -1,0 +1,55 @@
+name: stage4_sequential_residual_sleep
+experiment_type: sequential
+tasks:
+  - name: Task 1
+    prompt: Task 1
+    column_index: 0
+    dataset_variant: task1
+  - name: Task 2
+    prompt: Task 2
+    column_index: 1
+    dataset_variant: task2
+  - name: Task 1'
+    prompt: Task 1'
+    column_index: 2
+    dataset_variant: task1_prime
+    residual_from: Task 1
+    consolidate_into: Task 1
+  - name: Task 2'
+    prompt: Task 2'
+    column_index: 3
+    dataset_variant: task2_prime
+    residual_from: Task 2
+    consolidate_into: Task 2
+dataset:
+  root: assets/data
+  held_out_fraction: 0.2
+  max_train_samples: 4000
+  use_fake_data: false
+  download: true
+training:
+  epochs: 30
+  batch_size: 64
+  base_learning_rate: 0.02
+  seed: 67
+  task_schedule:
+    - Task 1
+    - Task 2
+    - Task 1'
+    - Task 2'
+masking:
+  learning_rate_scale: 0.2
+  threshold_shift: 0.4
+  prompt_vector_dim: 16
+model:
+  hidden_per_column: 96
+  time_steps: 5
+  beta: 0.9
+sleep:
+  enabled: true
+  epochs: 25
+  batch_size: 64
+  label_weight: 0.0
+  distillation_weight: 1.0
+  temperature: 1.2
+  held_out_replay: 1

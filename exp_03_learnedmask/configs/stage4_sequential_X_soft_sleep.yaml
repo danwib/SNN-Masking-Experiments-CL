@@ -1,0 +1,54 @@
+name: stage4_sequential_X_soft_sleep
+experiment_type: sequential
+tasks:
+  - name: task1
+    prompt: task1
+    column_index: 0
+    dataset_variant: task1
+  - name: task2
+    prompt: task2
+    column_index: 1
+    dataset_variant: task2
+dataset:
+  root: assets/data
+  held_out_fraction: 0.2
+  max_train_samples: 4000
+  use_fake_data: false
+  download: true
+training:
+  epochs: 25
+  batch_size: 64
+  base_learning_rate: 0.02
+  seed: 47
+  task_schedule:
+    - task1
+    - task2
+masking:
+  learning_rate_scale: 0.35
+  threshold_shift: 0.2
+  prompt_vector_dim: 16
+  mode: soft_columns
+  soft_columns:
+    total_columns: 8
+    base_columns: 8
+    base_tasks:
+      - task1
+      - task2
+    novel_tasks: []
+    temperature: 0.28
+    lambda_entropy: 0.02
+    lambda_balance: 0.03
+    lambda_overlap_novel: 0.0
+    mask_learning_rate: 0.05
+model:
+  hidden_per_column: 32
+  time_steps: 5
+  beta: 0.9
+sleep:
+  enabled: true
+  epochs: 15
+  batch_size: 64
+  label_weight: 0.0
+  distillation_weight: 1.0
+  temperature: 1.5
+  held_out_replay: 1
