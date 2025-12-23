@@ -97,6 +97,8 @@ class SleepDynamicDistillationConfig:
     momentum: float = 0.9
     initial_loss: float = 1.0
     similarity_influence: float = 0.0
+    gradient_similarity_influence: float = 0.0
+    gradient_update_interval: int = 1
 
 
 @dataclass

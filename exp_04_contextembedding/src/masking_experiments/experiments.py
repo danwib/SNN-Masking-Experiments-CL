@@ -303,8 +303,10 @@ def _sleep_train_batch(
     controller: MaskController | None = None,
     task_name: str | None = None,
     regularization: torch.Tensor | None = None,
-) -> tuple[float, torch.Tensor]:
+) -> tuple[float, torch.Tensor, torch.Tensor | None]:
     model.train()
+    if student_mask.prompt_vector.requires_grad:
+        student_mask.prompt_vector.retain_grad()
     student_outputs = model.forward(batch_features, student_mask)
     student_logits = model._select_logits(student_outputs, student_mask, target_column)
     temperature = max(cfg.temperature, 1e-3)
@@ -328,7 +330,10 @@ def _sleep_train_batch(
     model.zero_grad(set_to_none=True)
     if controller is not None:
         controller.zero_grad(task_name)
-    return float(combined_loss.item()), combined_losses.detach()
+    context_grad = None
+    if student_mask.prompt_vector.requires_grad and student_mask.prompt_vector.grad is not None:
+        context_grad = student_mask.prompt_vector.grad.detach().clone()
+    return float(combined_loss.item()), combined_losses.detach(), context_grad
 
 
 def _distillation_scale(temperature: float) -> float:
@@ -355,7 +360,7 @@ def _run_dynamic_sleep(
             state_cache[task.name] = _DynamicReplayState(dataset.train_features.shape[0], dynamic_cfg)
         return state_cache[task.name]
 
-    def _run_indices(base_task: TaskConfig, member: TaskConfig, batch_indices: torch.Tensor) -> torch.Tensor:
+    def _run_indices(base_task: TaskConfig, member: TaskConfig, batch_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         dataset = datasets[member.name]
         features = dataset.train_features.index_select(0, batch_indices)
         labels = dataset.train_labels.index_select(0, batch_indices)
@@ -364,7 +369,7 @@ def _run_dynamic_sleep(
         regularization = controller.regularization_loss(base_task.name)
         if regularization is not None:
             regularization = regularization.to(device)
-        _, per_sample_losses = _sleep_train_batch(
+        _, per_sample_losses, context_grad = _sleep_train_batch(
             model=model,
             teacher=teacher,
             batch_features=features.to(device),
@@ -380,7 +385,7 @@ def _run_dynamic_sleep(
         )
         state = _get_state(member)
         state.update_losses(batch_indices.cpu(), per_sample_losses.detach().cpu())
-        return per_sample_losses.detach()
+        return per_sample_losses.detach(), context_grad
 
     def _replay_sequence(base_task: TaskConfig, member: TaskConfig, order: torch.Tensor) -> None:
         if order.numel() == 0:
@@ -436,8 +441,19 @@ def _run_dynamic_sleep(
         warmup_cycle += 1
 
     # Adaptive epochs
-    similarity = {}
     context_vectors: Dict[str, torch.Tensor] = {}
+    if dynamic_cfg.gradient_similarity_influence > 0.0:
+        with torch.no_grad():
+            for base_name, members in groups.items():
+                for member in members:
+                    if member.name not in context_vectors:
+                        vec = controller.context_vector(member.name)
+                        norm = vec.norm()
+                        if norm > 0:
+                            vec = vec / norm
+                        context_vectors[member.name] = vec.cpu()
+
+    grad_counters: Dict[str, int] = {name: 0 for name in datasets.keys()}
 
     for epoch in range(sleep_cfg.epochs):
         for base_name, members in groups.items():
@@ -472,7 +488,14 @@ def _run_dynamic_sleep(
                         continue
                     batch_indices = batch_list[positions[member_idx]]
                     positions[member_idx] += 1
-                    _run_indices(base_task, member, batch_indices.long())
+                    losses, context_grad = _run_indices(base_task, member, batch_indices.long())
+                    if (
+                        dynamic_cfg.gradient_similarity_influence > 0.0
+                        and context_grad is not None
+                        and (grad_counters[member.name] % max(1, dynamic_cfg.gradient_update_interval) == 0)
+                    ):
+                        _apply_gradient_influence(state_cache, member.name, context_grad, context_vectors, dynamic_cfg)
+                    grad_counters[member.name] += 1
 
 
 def _compute_error_overlap(
@@ -767,3 +790,30 @@ def _ensure_task_ids(tasks: Sequence[TaskConfig]) -> None:
         task.task_id = next_id
         used[next_id] = task
         next_id += 1
+def _apply_gradient_influence(
+    states: Dict[str, _DynamicReplayState],
+    source_task: str,
+    gradient: torch.Tensor | None,
+    context_vectors: Dict[str, torch.Tensor],
+    cfg: SleepDynamicDistillationConfig,
+) -> None:
+    if gradient is None:
+        return
+    grad_norm = float(gradient.norm().item())
+    if grad_norm <= 0.0:
+        return
+    source_vec = context_vectors.get(source_task)
+    if source_vec is None:
+        return
+    for other_name, other_state in states.items():
+        if other_name == source_task:
+            continue
+        target_vec = context_vectors.get(other_name)
+        if target_vec is None:
+            continue
+        sim = float(torch.dot(source_vec, target_vec).item())
+        if sim <= 0.0:
+            continue
+        delta = cfg.gradient_similarity_influence * grad_norm * sim
+        if delta != 0.0:
+            other_state.adjust_probability_bias(delta)

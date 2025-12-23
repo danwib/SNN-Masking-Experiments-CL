@@ -17,7 +17,12 @@ from masking_experiments.config import (
     load_config,
 )
 from masking_experiments.data import TaskDataset
-from masking_experiments.experiments import run_experiment, _DynamicReplayState, _distillation_scale
+from masking_experiments.experiments import (
+    run_experiment,
+    _DynamicReplayState,
+    _distillation_scale,
+    _apply_gradient_influence,
+)
 from masking_experiments.masking import MaskController
 from masking_experiments.snn import SparseSNN
 
@@ -620,6 +625,27 @@ def test_dynamic_sleep_phase_runs_end_to_end():
     )
     result = run_experiment(config)
     assert result.stages[-1].label == "after_sleep"
+
+
+def test_gradient_similarity_influence_updates_bias():
+    cfg = SleepDynamicDistillationConfig(
+        enabled=True,
+        warmup_passes=0.0,
+        top_percent=0.0,
+        extra_percent=0.0,
+        gradient_similarity_influence=0.5,
+    )
+    states = {
+        "taskA": _DynamicReplayState(dataset_size=4, cfg=cfg),
+        "taskB": _DynamicReplayState(dataset_size=4, cfg=cfg),
+    }
+    vecs = {
+        "taskA": torch.tensor([1.0, 0.0]),
+        "taskB": torch.tensor([1.0, 0.0]),
+    }
+    grad = torch.tensor([0.0, 2.0])
+    _apply_gradient_influence(states, "taskA", grad, vecs, cfg)
+    assert states["taskB"].probability_bias > 0.0
 
 
 def test_distillation_scale_clamps_low_temperatures():
