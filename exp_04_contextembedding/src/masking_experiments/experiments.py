@@ -307,7 +307,7 @@ def _sleep_train_batch(
     model.train()
     student_outputs = model.forward(batch_features, student_mask)
     student_logits = model._select_logits(student_outputs, student_mask, target_column)
-    temperature = max(cfg.temperature, 0.1)
+    temperature = max(cfg.temperature, 1e-3)
     distill_scale = _distillation_scale(temperature)
     label_losses = F.binary_cross_entropy_with_logits(student_logits, batch_labels, reduction="none")
 
@@ -332,7 +332,7 @@ def _sleep_train_batch(
 
 
 def _distillation_scale(temperature: float) -> float:
-    return temperature**2
+    return max(1.0, temperature) ** 2
 
 
 def _run_dynamic_sleep(

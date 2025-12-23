@@ -604,6 +604,6 @@ def test_dynamic_sleep_phase_runs_end_to_end():
 
 def test_distillation_scale_clamps_low_temperatures():
     assert _distillation_scale(0.0) == pytest.approx(1.0)
-    assert _distillation_scale(0.5) == pytest.approx(1.0)
+    assert _distillation_scale(0.1) == pytest.approx(1.0)
     assert _distillation_scale(1.0) == pytest.approx(1.0)
     assert _distillation_scale(2.0) == pytest.approx(4.0)
