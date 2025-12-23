@@ -17,7 +17,7 @@ from masking_experiments.config import (
     load_config,
 )
 from masking_experiments.data import TaskDataset
-from masking_experiments.experiments import run_experiment, _DynamicReplayState
+from masking_experiments.experiments import run_experiment, _DynamicReplayState, _distillation_scale
 from masking_experiments.masking import MaskController
 from masking_experiments.snn import SparseSNN
 
@@ -600,3 +600,10 @@ def test_dynamic_sleep_phase_runs_end_to_end():
     )
     result = run_experiment(config)
     assert result.stages[-1].label == "after_sleep"
+
+
+def test_distillation_scale_clamps_low_temperatures():
+    assert _distillation_scale(0.0) == pytest.approx(1.0)
+    assert _distillation_scale(0.5) == pytest.approx(1.0)
+    assert _distillation_scale(1.0) == pytest.approx(1.0)
+    assert _distillation_scale(2.0) == pytest.approx(4.0)

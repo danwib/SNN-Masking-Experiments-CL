@@ -308,6 +308,7 @@ def _sleep_train_batch(
     student_outputs = model.forward(batch_features, student_mask)
     student_logits = model._select_logits(student_outputs, student_mask, target_column)
     temperature = max(cfg.temperature, 1e-3)
+    distill_scale = _distillation_scale(cfg.temperature)
     label_losses = F.binary_cross_entropy_with_logits(student_logits, batch_labels, reduction="none")
 
     with torch.no_grad():
@@ -316,7 +317,7 @@ def _sleep_train_batch(
     teacher_soft = torch.sigmoid(teacher_logits / temperature)
     student_soft = student_logits / temperature
     distill_losses = F.binary_cross_entropy_with_logits(student_soft, teacher_soft, reduction="none")
-    combined_losses = cfg.label_weight * label_losses + cfg.distillation_weight * (temperature**2) * distill_losses
+    combined_losses = cfg.label_weight * label_losses + cfg.distillation_weight * distill_scale * distill_losses
     combined_loss = combined_losses.mean()
     if regularization is not None:
         combined_loss = combined_loss + regularization
@@ -328,6 +329,11 @@ def _sleep_train_batch(
     if controller is not None:
         controller.zero_grad(task_name)
     return float(combined_loss.item()), combined_losses.detach()
+
+
+def _distillation_scale(temperature: float) -> float:
+    adjusted = max(temperature, 1e-3)
+    return adjusted**2 if adjusted >= 1.0 else 1.0
 
 
 def _run_dynamic_sleep(
