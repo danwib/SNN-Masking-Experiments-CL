@@ -54,6 +54,8 @@ class MaskingConfig:
     prompt_vector_dim: int = 16
     prompt_mode: str = "hash"
     prompt_learning_rate: float = 0.01
+    include_input_in_prompt: bool = False
+    prompt_input_scale: float = 1.0
     mode: str = "hard_columns"
     soft_columns: "SoftColumnMaskConfig" = field(default_factory=lambda: SoftColumnMaskConfig())
 
@@ -87,12 +89,14 @@ class SleepDynamicDistillationConfig:
 
     enabled: bool = False
     warmup_passes: float = 1.0
+    prime_warmup_passes: float = 0.0
     top_percent: float = 0.3
     extra_percent: float = 0.1
     min_probability: float = 0.05
     use_moving_average: bool = True
     momentum: float = 0.9
     initial_loss: float = 1.0
+    similarity_influence: float = 0.0
 
 
 @dataclass

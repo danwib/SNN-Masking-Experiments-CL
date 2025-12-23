@@ -45,6 +45,8 @@ masking:
   prompt_vector_dim: 16
   prompt_mode: learned_task_id
   prompt_learning_rate: 0.02
+  include_input_in_prompt: true
+  prompt_input_scale: 0.7
   mode: soft_columns
   soft_columns:
     total_columns: 8
@@ -75,9 +77,11 @@ sleep:
   dynamic:
     enabled: true
     warmup_passes: 0.75
+    prime_warmup_passes: 0.5
     top_percent: 0.4
     extra_percent: 0.2
     min_probability: 0.1
     use_moving_average: true
     momentum: 0.85
     initial_loss: 1.0
+    similarity_influence: 0.3

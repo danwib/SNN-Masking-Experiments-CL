@@ -33,11 +33,21 @@ class Mask:
 class MaskController:
     """Build masks based on task prompts."""
 
-    def __init__(self, tasks: List[TaskConfig], config: MaskingConfig) -> None:
+    def __init__(
+        self,
+        tasks: List[TaskConfig],
+        config: MaskingConfig,
+        task_input_stats: Optional[Dict[str, torch.Tensor]] = None,
+        input_dim: int | None = None,
+    ) -> None:
         self._task_by_prompt: Dict[str, TaskConfig] = {task.prompt: task for task in tasks}
         self._tasks_by_name: Dict[str, TaskConfig] = {task.name: task for task in tasks}
         self._tasks = list(tasks)
         self._config = config
+        self._task_input_stats: Dict[str, torch.Tensor] = {}
+        if task_input_stats:
+            for name, stats in task_input_stats.items():
+                self._task_input_stats[name] = stats.clone().detach()
         num_embeddings = None
         if config.prompt_mode.lower() == "learned_task_id":
             task_ids = [task.task_id for task in tasks]
@@ -50,6 +60,9 @@ class MaskController:
             mode=config.prompt_mode,
             num_embeddings=num_embeddings,
             learning_rate=config.prompt_learning_rate,
+            include_input=config.include_input_in_prompt,
+            input_dim=input_dim if config.include_input_in_prompt else None,
+            input_scale=config.prompt_input_scale,
         )
         self.num_columns = max(task.column_index for task in tasks) + 1
 
@@ -90,7 +103,7 @@ class MaskController:
             if idx != task.column_index:
                 lr_scale[idx] = 0.0
 
-        prompt_vec = self._prompt_vectors.vector(task.prompt, task.task_id)
+        prompt_vec = self._context_vector(task)
         column_mask = self._column_mask_tensor(active_columns)
 
         return Mask(
@@ -125,15 +138,35 @@ class MaskController:
         self._prompt_vectors.to(device)
         return self
 
+    def context_vector(self, task_name: str) -> torch.Tensor:
+        task = self._tasks_by_name[task_name]
+        return self._context_vector(task).detach()
+
+    def _context_vector(self, task: TaskConfig) -> torch.Tensor:
+        stats = self._task_input_stats.get(task.name)
+        if self._config.include_input_in_prompt and stats is None:
+            raise ValueError(f"No input statistics registered for task '{task.name}'.")
+        return self._prompt_vectors.vector(task.prompt, task.task_id, stats)
+
 
 class SoftColumnMaskController(nn.Module):
     """Learnable soft mask controller with base/novel column banks."""
 
-    def __init__(self, tasks: List[TaskConfig], config: MaskingConfig) -> None:
+    def __init__(
+        self,
+        tasks: List[TaskConfig],
+        config: MaskingConfig,
+        task_input_stats: Optional[Dict[str, torch.Tensor]] = None,
+        input_dim: int | None = None,
+    ) -> None:
         super().__init__()
         self._tasks_by_name: Dict[str, TaskConfig] = {task.name: task for task in tasks}
         self._tasks_by_prompt: Dict[str, TaskConfig] = {task.prompt: task for task in tasks}
         self._config = config
+        self._task_input_stats: Dict[str, torch.Tensor] = {}
+        if task_input_stats:
+            for name, stats in task_input_stats.items():
+                self._task_input_stats[name] = stats.clone().detach()
         num_embeddings = None
         if config.prompt_mode.lower() == "learned_task_id":
             task_ids = [task.task_id for task in tasks]
@@ -146,6 +179,9 @@ class SoftColumnMaskController(nn.Module):
             mode=config.prompt_mode,
             num_embeddings=num_embeddings,
             learning_rate=config.prompt_learning_rate,
+            include_input=config.include_input_in_prompt,
+            input_dim=input_dim if config.include_input_in_prompt else None,
+            input_scale=config.prompt_input_scale,
         )
         self.soft_cfg: SoftColumnMaskConfig = config.soft_columns
         if self.soft_cfg.total_columns <= 0:
@@ -223,7 +259,7 @@ class SoftColumnMaskController(nn.Module):
         full_mask = self._full_mask(task.name, detach=False)
         lr_mask = full_mask.detach()
         threshold_shift = torch.zeros(self.total_columns, device=full_mask.device, dtype=full_mask.dtype)
-        prompt_vec = self.prompt_vectors.vector(task.prompt, task.task_id).to(full_mask.device)
+        prompt_vec = self._context_vector(task).to(full_mask.device)
         return Mask(
             learning_rate_scale=lr_mask,
             threshold_shift=threshold_shift,
@@ -308,3 +344,13 @@ class SoftColumnMaskController(nn.Module):
         super().to(device)
         self._device = device
         return self
+
+    def context_vector(self, task_name: str) -> torch.Tensor:
+        task = self._tasks_by_name[task_name]
+        return self._context_vector(task).detach()
+
+    def _context_vector(self, task: TaskConfig) -> torch.Tensor:
+        stats = self._task_input_stats.get(task.name)
+        if self._config.include_input_in_prompt and stats is None:
+            raise ValueError(f"No input statistics registered for task '{task.name}'.")
+        return self.prompt_vectors.vector(task.prompt, task.task_id, stats)

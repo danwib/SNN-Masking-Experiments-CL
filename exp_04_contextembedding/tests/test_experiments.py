@@ -431,6 +431,28 @@ def test_learned_prompt_embeddings_receive_gradients():
     assert torch.count_nonzero(grad[0]).item() > 0
 
 
+def test_mask_controller_requires_input_stats_when_enabled():
+    tasks = _base_tasks()[:1]
+    cfg = MaskingConfig(
+        learning_rate_scale=0.2,
+        threshold_shift=0.1,
+        prompt_vector_dim=8,
+        include_input_in_prompt=True,
+    )
+    controller = MaskController(
+        tasks,
+        cfg,
+        task_input_stats={"Task 1": torch.zeros(4)},
+        input_dim=4,
+    )
+    mask = controller.build_mask("Task 1")
+    assert mask.prompt_vector.shape[0] == cfg.prompt_vector_dim
+
+    controller_missing = MaskController(tasks, cfg, input_dim=4)
+    with pytest.raises(ValueError):
+        controller_missing.build_mask("Task 1")
+
+
 def test_stage5A1_config_runs_with_fake_data():
     config_path = (
         Path(__file__).resolve().parents[1]
@@ -532,6 +554,8 @@ def test_dynamic_replay_state_updates_follow_momentum_rules():
     state_last = _DynamicReplayState(dataset_size=3, cfg=cfg_last)
     state_last.update_losses(torch.tensor([1]), torch.tensor([4.0]))
     assert state_last.losses[1].item() == pytest.approx(4.0)
+    state_last.adjust_probability_bias(0.3)
+    assert state_last.probability_bias == pytest.approx(0.3)
 
 
 def test_dynamic_sleep_phase_runs_end_to_end():

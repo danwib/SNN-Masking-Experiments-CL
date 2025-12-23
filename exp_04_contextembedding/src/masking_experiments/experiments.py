@@ -49,6 +49,7 @@ class _DynamicReplayState:
         self.use_moving_average = cfg.use_moving_average
         self.momentum = cfg.momentum
         self.min_probability = max(0.0, min(1.0, cfg.min_probability))
+        self.probability_bias = 0.0
 
     def has_warmup(self) -> bool:
         return (
@@ -95,10 +96,12 @@ class _DynamicReplayState:
             extra_k = 1
         extra_k = min(extra_k, available_for_extra)
 
+        bias_factor = max(0.0, 1.0 + self.probability_bias)
+        effective_losses = self.losses * bias_factor
         indices = torch.arange(total)
         selected: List[int] = []
         if top_k > 0:
-            _, top_idx = torch.topk(self.losses, k=top_k)
+            _, top_idx = torch.topk(effective_losses, k=top_k)
             selected.extend(top_idx.tolist())
             mask = torch.ones(total, dtype=torch.bool)
             mask[top_idx] = False
@@ -107,7 +110,7 @@ class _DynamicReplayState:
             remaining = indices
 
         if extra_k > 0 and remaining.numel() > 0:
-            weights = self.losses[remaining].clone()
+            weights = effective_losses[remaining].clone()
             if torch.all(weights <= 0):
                 weights = torch.ones_like(weights)
             probs = weights / weights.sum()
@@ -142,6 +145,12 @@ class _DynamicReplayState:
             self.losses[indices] = updated
         else:
             self.losses[indices] = new_losses
+
+    def adjust_probability_bias(self, delta: float) -> None:
+        self.probability_bias = float(max(-0.5, min(2.0, self.probability_bias + delta)))
+
+    def mean_loss(self) -> float:
+        return float(self.losses.mean().item())
 
     @staticmethod
     def _pop_indices(storage: List[int], batch_size: int) -> torch.Tensor | None:
@@ -341,7 +350,7 @@ def _run_dynamic_sleep(
             state_cache[task.name] = _DynamicReplayState(dataset.train_features.shape[0], dynamic_cfg)
         return state_cache[task.name]
 
-    def _run_indices(base_task: TaskConfig, member: TaskConfig, batch_indices: torch.Tensor) -> None:
+    def _run_indices(base_task: TaskConfig, member: TaskConfig, batch_indices: torch.Tensor) -> torch.Tensor:
         dataset = datasets[member.name]
         features = dataset.train_features.index_select(0, batch_indices)
         labels = dataset.train_labels.index_select(0, batch_indices)
@@ -366,9 +375,42 @@ def _run_dynamic_sleep(
         )
         state = _get_state(member)
         state.update_losses(batch_indices.cpu(), per_sample_losses.detach().cpu())
+        return per_sample_losses.detach()
+
+    def _replay_sequence(base_task: TaskConfig, member: TaskConfig, order: torch.Tensor) -> None:
+        if order.numel() == 0:
+            return
+        for start in range(0, order.shape[0], batch_size):
+            batch_indices = order[start : start + batch_size]
+            _run_indices(base_task, member, batch_indices.long())
 
     # Warm-up stage
+    # Prime-specific warmup: focus on x' tasks before general passes.
+    prime_passes = dynamic_cfg.prime_warmup_passes
+    if prime_passes > 0:
+        for base_name, members in groups.items():
+            base_task = members[0]
+            for member in members[1:]:
+                _get_state(member)
+                dataset = datasets[member.name]
+                total = dataset.train_features.shape[0]
+                generator = torch.Generator().manual_seed(
+                    seed + 1500 + base_task.column_index * 53 + member.column_index * 59
+                )
+                full_passes = int(math.floor(prime_passes))
+                for pass_idx in range(full_passes):
+                    order = torch.randperm(total, generator=generator)
+                    _replay_sequence(base_task, member, order, generator)
+                fractional = prime_passes - float(full_passes)
+                if fractional > 0:
+                    count = max(1, int(math.ceil(total * fractional)))
+                    order = torch.randperm(total, generator=generator)[:count]
+                    _replay_sequence(base_task, member, order, generator)
+
     warmup_cycle = 0
+    for base_name, members in groups.items():
+        for member in members:
+            _get_state(member)
     while True:
         made_progress = False
         for base_name, members in groups.items():
@@ -389,6 +431,23 @@ def _run_dynamic_sleep(
         warmup_cycle += 1
 
     # Adaptive epochs
+    similarity = {}
+    context_vectors: Dict[str, torch.Tensor] = {}
+    if dynamic_cfg.similarity_influence > 0.0:
+        for base_name, members in groups.items():
+            for member in members:
+                if member.name not in context_vectors:
+                    context_vectors[member.name] = controller.context_vector(member.name).detach().cpu()
+        names = list(context_vectors.keys())
+        for i, name_a in enumerate(names):
+            vec_a = context_vectors[name_a].unsqueeze(0)
+            for name_b in names[i + 1 :]:
+                vec_b = context_vectors[name_b].unsqueeze(0)
+                sim = float(F.cosine_similarity(vec_a, vec_b, dim=-1).item())
+                sim = max(0.0, sim)
+                similarity[(name_a, name_b)] = sim
+                similarity[(name_b, name_a)] = sim
+
     for epoch in range(sleep_cfg.epochs):
         for base_name, members in groups.items():
             base_task = members[0]
@@ -399,7 +458,17 @@ def _run_dynamic_sleep(
                 )
                 batches = state.plan_dynamic_batches(batch_size, dynamic_cfg, generator)
                 for batch_indices in batches:
-                    _run_indices(base_task, member, batch_indices.long())
+                    losses = _run_indices(base_task, member, batch_indices.long())
+                    if dynamic_cfg.similarity_influence > 0.0 and losses.numel() > 0:
+                        mean_loss = float(losses.mean().item())
+                        for other_name, other_state in state_cache.items():
+                            if other_name == member.name:
+                                continue
+                            sim = similarity.get((member.name, other_name), 0.0)
+                            if sim <= 0.0:
+                                continue
+                            delta = dynamic_cfg.similarity_influence * sim * (mean_loss - 0.5)
+                            other_state.adjust_probability_bias(delta)
 
 
 def _compute_error_overlap(
@@ -423,14 +492,26 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
     datasets = build_datasets(tasks, config.dataset, config.training.seed)
     any_task = next(iter(datasets.values()))
     input_dim = any_task.train_features.shape[1]
+    task_input_stats: Dict[str, torch.Tensor] = {}
+    for task in tasks:
+        data = datasets[task.name]
+        task_input_stats[task.name] = data.train_features.mean(dim=0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mask_mode = config.masking.mode.lower()
     if mask_mode == "soft_columns":
-        controller: MaskController | SoftColumnMaskController = SoftColumnMaskController(
-            list(tasks), config.masking
+        controller = SoftColumnMaskController(
+            list(tasks),
+            config.masking,
+            task_input_stats=task_input_stats if config.masking.include_input_in_prompt else None,
+            input_dim=input_dim,
         ).to(device)
     else:
-        controller = MaskController(list(tasks), config.masking).to(device)
+        controller = MaskController(
+            list(tasks),
+            config.masking,
+            task_input_stats=task_input_stats if config.masking.include_input_in_prompt else None,
+            input_dim=input_dim,
+        ).to(device)
     model = SparseSNN(
         input_dim=input_dim,
         num_columns=controller.num_columns,
