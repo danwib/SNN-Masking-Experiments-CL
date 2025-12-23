@@ -400,12 +400,12 @@ def _run_dynamic_sleep(
                 full_passes = int(math.floor(prime_passes))
                 for pass_idx in range(full_passes):
                     order = torch.randperm(total, generator=generator)
-                    _replay_sequence(base_task, member, order, generator)
+                    _replay_sequence(base_task, member, order)
                 fractional = prime_passes - float(full_passes)
                 if fractional > 0:
                     count = max(1, int(math.ceil(total * fractional)))
                     order = torch.randperm(total, generator=generator)[:count]
-                    _replay_sequence(base_task, member, order, generator)
+                    _replay_sequence(base_task, member, order)
 
     warmup_cycle = 0
     for base_name, members in groups.items():
