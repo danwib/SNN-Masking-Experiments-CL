@@ -39,6 +39,14 @@ training:
     - task2
     - task1_prime
     - task2_prime
+  sleep_after:
+    - task2
+    - task2_prime
+  sleep_promotions:
+    task2:
+      - task1
+      - task2
+  final_sleep: false
 masking:
   learning_rate_scale: 0.35
   threshold_shift: 0.2

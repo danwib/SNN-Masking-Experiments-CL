@@ -614,7 +614,41 @@ def _run_sequential(
     schedule = config.training.task_schedule or [task.name for task in tasks]
     name_to_task = {task.name: task for task in tasks}
 
-    for task_name in schedule:
+    sleep_cfg = config.sleep
+    training_sleep_after = set(config.training.sleep_after)
+
+    def _trigger_sleep(stage_name: str | None = None) -> None:
+        nonlocal prev_metrics
+        if not sleep_cfg or not sleep_cfg.enabled:
+            return
+        before_metrics, pre_sleep_predictions = _evaluate(
+            model,
+            datasets,
+            tasks,
+            controller,
+            device,
+            return_predictions=True,
+        )
+        label = "before_sleep" if stage_name is None else f"before_sleep_{stage_name}"
+        mask_logs = _snapshot_masks(controller)
+        deltas = _compute_metric_deltas(prev_metrics, before_metrics)
+        results.append(StageResult(label=label, metrics=before_metrics, mask_logs=mask_logs, metric_deltas=deltas))
+        prev_metrics = {metric.task_name: metric.accuracy for metric in before_metrics}
+        sleep_results = _run_sleep_phase(
+            model=model,
+            datasets=datasets,
+            tasks=tasks,
+            controller=controller,
+            device=device,
+            config=config,
+            pre_sleep_predictions=pre_sleep_predictions,
+            previous_metrics=prev_metrics,
+        )
+        sleep_metrics_map = {metric.task_name: metric.accuracy for metric in sleep_results[-1].metrics}
+        prev_metrics = sleep_metrics_map
+        results.extend(sleep_results)
+
+    for task_name_idx, task_name in enumerate(schedule):
         if task_name not in name_to_task:
             continue
         _train_task(
@@ -634,34 +668,14 @@ def _run_sequential(
             StageResult(label=f"after_{task_name}", metrics=metrics, mask_logs=mask_logs, metric_deltas=deltas)
         )
         prev_metrics = {metric.task_name: metric.accuracy for metric in metrics}
+        if sleep_cfg and sleep_cfg.enabled and task_name in training_sleep_after:
+            _trigger_sleep(stage_name=task_name)
+            promotions = config.training.sleep_promotions.get(task_name, [])
+            if promotions:
+                controller.promote_to_base(promotions)
 
-    sleep_cfg = config.sleep
-    if sleep_cfg and sleep_cfg.enabled:
-        before_metrics, pre_sleep_predictions = _evaluate(
-            model,
-            datasets,
-            tasks,
-            controller,
-            device,
-            return_predictions=True,
-        )
-        mask_logs = _snapshot_masks(controller)
-        deltas = _compute_metric_deltas(prev_metrics, before_metrics)
-        results.append(StageResult(label="before_sleep", metrics=before_metrics, mask_logs=mask_logs, metric_deltas=deltas))
-        prev_metrics = {metric.task_name: metric.accuracy for metric in before_metrics}
-        sleep_results = _run_sleep_phase(
-            model=model,
-            datasets=datasets,
-            tasks=tasks,
-            controller=controller,
-            device=device,
-            config=config,
-            pre_sleep_predictions=pre_sleep_predictions,
-            previous_metrics=prev_metrics,
-        )
-        sleep_metrics_map = {metric.task_name: metric.accuracy for metric in sleep_results[-1].metrics}
-        prev_metrics = sleep_metrics_map
-        results.extend(sleep_results)
+    if sleep_cfg and sleep_cfg.enabled and config.training.final_sleep:
+        _trigger_sleep()
 
     return results
 

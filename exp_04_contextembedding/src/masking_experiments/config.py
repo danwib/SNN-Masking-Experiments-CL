@@ -43,6 +43,9 @@ class TrainingConfig:
     base_learning_rate: float = 0.01
     seed: int = 13
     task_schedule: List[str] = field(default_factory=list)
+    sleep_after: List[str] = field(default_factory=list)
+    sleep_promotions: Dict[str, List[str]] = field(default_factory=dict)
+    final_sleep: bool = True
 
 
 @dataclass

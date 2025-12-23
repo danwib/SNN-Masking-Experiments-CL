@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -137,6 +137,9 @@ class MaskController:
     def to(self, device: torch.device) -> "MaskController":
         self._prompt_vectors.to(device)
         return self
+
+    def promote_to_base(self, task_names: Sequence[str]) -> None:
+        return
 
     def context_vector(self, task_name: str) -> torch.Tensor:
         task = self._tasks_by_name[task_name]
@@ -412,3 +415,21 @@ class SoftColumnMaskController(nn.Module):
         if self._config.include_input_in_prompt and stats is None:
             raise ValueError(f"No input statistics registered for task '{task.name}'.")
         return self.prompt_vectors.vector(task.prompt, task.task_id, stats)
+
+    def promote_to_base(self, task_names: Sequence[str]) -> None:
+        for name in task_names:
+            if name not in self._task_to_bank:
+                continue
+            current_bank = self._task_to_bank[name]
+            if current_bank == "base":
+                continue
+            try:
+                self._bank_to_tasks[current_bank].remove(name)
+            except (KeyError, ValueError):
+                pass
+            self._bank_to_tasks["base"].append(name)
+            self._task_to_bank[name] = "base"
+            if not self.use_key_query:
+                new_size = self._bank_size("base")
+                device = self.logits[name].device
+                self.logits[name] = nn.Parameter(torch.zeros(new_size, device=device))
