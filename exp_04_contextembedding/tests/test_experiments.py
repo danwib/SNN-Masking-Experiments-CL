@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -9,13 +10,14 @@ from masking_experiments.config import (
     MaskingConfig,
     ModelConfig,
     SleepPhaseConfig,
+    SleepDynamicDistillationConfig,
     SoftColumnMaskConfig,
     TaskConfig,
     TrainingConfig,
     load_config,
 )
 from masking_experiments.data import TaskDataset
-from masking_experiments.experiments import run_experiment
+from masking_experiments.experiments import run_experiment, _DynamicReplayState
 from masking_experiments.masking import MaskController
 from masking_experiments.snn import SparseSNN
 
@@ -477,3 +479,100 @@ def test_wake_training_changes_between_initial_and_after_task1(monkeypatch):
     after_task1 = next(stage for stage in result.stages if stage.label == "after_Task 1")
     assert after_task1.metric_deltas is not None
     assert any(abs(delta) > 1e-6 for delta in after_task1.metric_deltas.values())
+
+
+def test_dynamic_replay_state_handles_warmup_and_selection():
+    cfg = SleepDynamicDistillationConfig(
+        enabled=True,
+        warmup_passes=1.5,
+        top_percent=0.5,
+        extra_percent=0.25,
+        min_probability=0.2,
+        use_moving_average=True,
+        momentum=0.5,
+    )
+    state = _DynamicReplayState(dataset_size=8, cfg=cfg)
+    generator = torch.Generator().manual_seed(0)
+    total_seen = 0
+    while True:
+        batch = state.next_warmup_batch(batch_size=2, generator=generator)
+        if batch is None:
+            break
+        total_seen += batch.numel()
+    assert total_seen == 12  # one full pass plus half pass
+    state.losses = torch.tensor([0.1, 0.2, 0.3, 0.4, 1.0, 1.1, 1.2, 1.3], dtype=torch.float32)
+    generator = torch.Generator().manual_seed(1)
+    batches = state.plan_dynamic_batches(batch_size=2, cfg=cfg, generator=generator)
+    selected = torch.cat(batches) if batches else torch.tensor([], dtype=torch.long)
+    assert selected.numel() == 6  # top 4 plus 2 extras
+    top_set = set([4, 5, 6, 7])
+    assert top_set.issubset(set(selected.tolist()))
+
+
+def test_dynamic_replay_state_updates_follow_momentum_rules():
+    cfg_ma = SleepDynamicDistillationConfig(
+        enabled=True,
+        warmup_passes=0.0,
+        top_percent=0.0,
+        extra_percent=0.0,
+        use_moving_average=True,
+        momentum=0.5,
+    )
+    state_ma = _DynamicReplayState(dataset_size=3, cfg=cfg_ma)
+    state_ma.update_losses(torch.tensor([0]), torch.tensor([2.0]))
+    assert state_ma.losses[0].item() == pytest.approx(1.5)
+
+    cfg_last = SleepDynamicDistillationConfig(
+        enabled=True,
+        warmup_passes=0.0,
+        top_percent=0.0,
+        extra_percent=0.0,
+        use_moving_average=False,
+    )
+    state_last = _DynamicReplayState(dataset_size=3, cfg=cfg_last)
+    state_last.update_losses(torch.tensor([1]), torch.tensor([4.0]))
+    assert state_last.losses[1].item() == pytest.approx(4.0)
+
+
+def test_dynamic_sleep_phase_runs_end_to_end():
+    tasks = _sleep_tasks()
+    sleep_cfg = SleepPhaseConfig(
+        enabled=True,
+        epochs=1,
+        batch_size=16,
+        label_weight=0.0,
+        distillation_weight=1.0,
+        temperature=0.0,
+        dynamic=SleepDynamicDistillationConfig(
+            enabled=True,
+            warmup_passes=0.5,
+            top_percent=0.5,
+            extra_percent=0.25,
+            min_probability=0.1,
+            use_moving_average=False,
+        ),
+    )
+    config = ExperimentConfig(
+        name="dynamic_sleep",
+        experiment_type="sequential",
+        tasks=tasks,
+        dataset=DatasetConfig(
+            root="tests/.fake_data",
+            held_out_fraction=0.1,
+            max_train_samples=64,
+            use_fake_data=True,
+            download=False,
+        ),
+        training=TrainingConfig(
+            epochs=1,
+            batch_size=16,
+            base_learning_rate=0.01,
+            seed=23,
+            task_schedule=["Task 1", "Task 2", "Task 1'", "Task 2'"],
+        ),
+        masking=MaskingConfig(learning_rate_scale=0.2, threshold_shift=0.3, prompt_vector_dim=8),
+        model=ModelConfig(hidden_per_column=16, time_steps=3, beta=0.9),
+        sleep=sleep_cfg,
+    )
+    result = run_experiment(config)
+    assert result.stages[-1].label == "after_sleep"

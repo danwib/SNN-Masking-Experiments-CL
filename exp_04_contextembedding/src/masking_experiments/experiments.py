@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Iterable, List, Sequence
 
 import torch
 import torch.nn.functional as F
 
-from .config import ExperimentConfig, SleepPhaseConfig, TaskConfig
+from .config import ExperimentConfig, SleepDynamicDistillationConfig, SleepPhaseConfig, TaskConfig
 from .data import TaskDataset, build_datasets
 from .masking import Mask, MaskController, SoftColumnMaskController
 from .snn import SparseSNN
@@ -27,6 +28,128 @@ class StageResult:
     metrics: List[TaskMetric]
     mask_logs: Dict[str, Dict[str, Any]] | None = None
     metric_deltas: Dict[str, float] | None = None
+
+
+class _DynamicReplayState:
+    """Tracks per-sample losses and warmup progress for adaptive sleep distillation."""
+
+    def __init__(self, dataset_size: int, cfg: SleepDynamicDistillationConfig) -> None:
+        if dataset_size <= 0:
+            raise ValueError("Dynamic replay requires at least one sample.")
+        self.losses = torch.full((dataset_size,), cfg.initial_loss, dtype=torch.float32)
+        warmup = max(0.0, cfg.warmup_passes)
+        self._full_passes_remaining = int(math.floor(warmup))
+        fractional = warmup - float(self._full_passes_remaining)
+        fraction_count = int(math.ceil(fractional * dataset_size))
+        if fractional > 0.0 and fraction_count == 0:
+            fraction_count = 1
+        self._fraction_indices: List[int] = []
+        self._fraction_pending = fraction_count
+        self._current_full_indices: List[int] = []
+        self.use_moving_average = cfg.use_moving_average
+        self.momentum = cfg.momentum
+        self.min_probability = max(0.0, min(1.0, cfg.min_probability))
+
+    def has_warmup(self) -> bool:
+        return (
+            self._full_passes_remaining > 0
+            or bool(self._current_full_indices)
+            or self._fraction_pending > 0
+            or bool(self._fraction_indices)
+        )
+
+    def next_warmup_batch(self, batch_size: int, generator: torch.Generator) -> torch.Tensor | None:
+        if batch_size <= 0:
+            return None
+        if not self._current_full_indices and self._full_passes_remaining > 0:
+            perm = torch.randperm(self.losses.shape[0], generator=generator)
+            self._current_full_indices = perm.tolist()
+            self._full_passes_remaining -= 1
+        if self._current_full_indices:
+            return self._pop_indices(self._current_full_indices, batch_size)
+        if self._fraction_pending > 0 and not self._fraction_indices:
+            perm = torch.randperm(self.losses.shape[0], generator=generator)
+            take = min(self._fraction_pending, self.losses.shape[0])
+            self._fraction_indices = perm[:take].tolist()
+            self._fraction_pending = 0
+        if self._fraction_indices:
+            return self._pop_indices(self._fraction_indices, batch_size)
+        return None
+
+    def plan_dynamic_batches(
+        self, batch_size: int, cfg: SleepDynamicDistillationConfig, generator: torch.Generator
+    ) -> List[torch.Tensor]:
+        total = self.losses.shape[0]
+        if total == 0:
+            return []
+        batches: List[torch.Tensor] = []
+        top_ratio = max(0.0, min(1.0, cfg.top_percent))
+        extra_ratio = max(0.0, min(1.0, cfg.extra_percent))
+        top_k = int(round(top_ratio * total))
+        if top_ratio > 0.0 and top_k == 0:
+            top_k = 1
+        top_k = min(top_k, total)
+        extra_k = int(round(extra_ratio * total))
+        available_for_extra = total - top_k
+        if extra_ratio > 0.0 and extra_k == 0 and available_for_extra > 0:
+            extra_k = 1
+        extra_k = min(extra_k, available_for_extra)
+
+        indices = torch.arange(total)
+        selected: List[int] = []
+        if top_k > 0:
+            _, top_idx = torch.topk(self.losses, k=top_k)
+            selected.extend(top_idx.tolist())
+            mask = torch.ones(total, dtype=torch.bool)
+            mask[top_idx] = False
+            remaining = indices[mask]
+        else:
+            remaining = indices
+
+        if extra_k > 0 and remaining.numel() > 0:
+            weights = self.losses[remaining].clone()
+            if torch.all(weights <= 0):
+                weights = torch.ones_like(weights)
+            probs = weights / weights.sum()
+            if self.min_probability > 0 and remaining.numel() > 0:
+                uniform = torch.full_like(probs, 1.0 / remaining.numel())
+                probs = (1.0 - self.min_probability) * probs + self.min_probability * uniform
+                probs = probs / probs.sum()
+            sampled = torch.multinomial(probs, num_samples=extra_k, replacement=False, generator=generator)
+            selected.extend(remaining[sampled].tolist())
+
+        if not selected:
+            return []
+
+        order = torch.tensor(selected, dtype=torch.long)
+        shuffle_perm = torch.randperm(order.shape[0], generator=generator)
+        order = order[shuffle_perm]
+        batches = [
+            order[start : start + batch_size]
+            for start in range(0, order.shape[0], batch_size)
+            if batch_size > 0
+        ]
+        return batches
+
+    def update_losses(self, indices: torch.Tensor, new_losses: torch.Tensor) -> None:
+        if indices.numel() == 0:
+            return
+        indices = indices.view(-1)
+        new_losses = new_losses.view(-1).to(self.losses.device)
+        if self.use_moving_average:
+            prev = self.losses[indices]
+            updated = self.momentum * prev + (1.0 - self.momentum) * new_losses
+            self.losses[indices] = updated
+        else:
+            self.losses[indices] = new_losses
+
+    @staticmethod
+    def _pop_indices(storage: List[int], batch_size: int) -> torch.Tensor | None:
+        if not storage:
+            return None
+        count = min(batch_size, len(storage))
+        batch = [storage.pop() for _ in range(count)]
+        return torch.tensor(batch, dtype=torch.long)
 
 
 @dataclass
@@ -171,20 +294,21 @@ def _sleep_train_batch(
     controller: MaskController | None = None,
     task_name: str | None = None,
     regularization: torch.Tensor | None = None,
-) -> float:
+) -> tuple[float, torch.Tensor]:
     model.train()
     student_outputs = model.forward(batch_features, student_mask)
     student_logits = model._select_logits(student_outputs, student_mask, target_column)
-    label_loss = F.binary_cross_entropy_with_logits(student_logits, batch_labels)
+    temperature = max(cfg.temperature, 1e-3)
+    label_losses = F.binary_cross_entropy_with_logits(student_logits, batch_labels, reduction="none")
 
     with torch.no_grad():
         teacher_outputs = teacher.forward(batch_features, teacher_mask)
         teacher_logits = teacher._select_logits(teacher_outputs, teacher_mask, teacher_column)
-    teacher_soft = torch.sigmoid(teacher_logits / cfg.temperature)
-    student_soft = student_logits / cfg.temperature
-    distill_loss = F.binary_cross_entropy_with_logits(student_soft, teacher_soft)
-
-    combined_loss = cfg.label_weight * label_loss + cfg.distillation_weight * (cfg.temperature**2) * distill_loss
+    teacher_soft = torch.sigmoid(teacher_logits / temperature)
+    student_soft = student_logits / temperature
+    distill_losses = F.binary_cross_entropy_with_logits(student_soft, teacher_soft, reduction="none")
+    combined_losses = cfg.label_weight * label_losses + cfg.distillation_weight * (temperature**2) * distill_losses
+    combined_loss = combined_losses.mean()
     if regularization is not None:
         combined_loss = combined_loss + regularization
     combined_loss.backward()
@@ -194,7 +318,88 @@ def _sleep_train_batch(
     model.zero_grad(set_to_none=True)
     if controller is not None:
         controller.zero_grad(task_name)
-    return float(combined_loss.item())
+    return float(combined_loss.item()), combined_losses.detach()
+
+
+def _run_dynamic_sleep(
+    model: SparseSNN,
+    teacher: SparseSNN,
+    groups: Dict[str, List[TaskConfig]],
+    datasets: Dict[str, TaskDataset],
+    controller: MaskController,
+    device: torch.device,
+    sleep_cfg: SleepPhaseConfig,
+    batch_size: int,
+    seed: int,
+) -> None:
+    dynamic_cfg = sleep_cfg.dynamic
+    state_cache: Dict[str, _DynamicReplayState] = {}
+
+    def _get_state(task: TaskConfig) -> _DynamicReplayState:
+        if task.name not in state_cache:
+            dataset = datasets[task.name]
+            state_cache[task.name] = _DynamicReplayState(dataset.train_features.shape[0], dynamic_cfg)
+        return state_cache[task.name]
+
+    def _run_indices(base_task: TaskConfig, member: TaskConfig, batch_indices: torch.Tensor) -> None:
+        dataset = datasets[member.name]
+        features = dataset.train_features.index_select(0, batch_indices)
+        labels = dataset.train_labels.index_select(0, batch_indices)
+        student_mask = controller.build_mask(base_task.prompt).to(device)
+        teacher_mask = controller.build_mask(member.prompt).to(device)
+        regularization = controller.regularization_loss(base_task.name)
+        if regularization is not None:
+            regularization = regularization.to(device)
+        _, per_sample_losses = _sleep_train_batch(
+            model=model,
+            teacher=teacher,
+            batch_features=features.to(device),
+            batch_labels=labels.to(device),
+            student_mask=student_mask,
+            teacher_mask=teacher_mask,
+            target_column=base_task.column_index,
+            teacher_column=member.column_index,
+            cfg=sleep_cfg,
+            controller=controller,
+            task_name=base_task.name,
+            regularization=regularization,
+        )
+        state = _get_state(member)
+        state.update_losses(batch_indices.cpu(), per_sample_losses.detach().cpu())
+
+    # Warm-up stage
+    warmup_cycle = 0
+    while True:
+        made_progress = False
+        for base_name, members in groups.items():
+            base_task = members[0]
+            for member in members:
+                state = _get_state(member)
+                generator = torch.Generator().manual_seed(
+                    seed + 1000 + warmup_cycle * 17 + base_task.column_index * 29 + member.column_index * 31
+                )
+                while True:
+                    batch_indices = state.next_warmup_batch(batch_size, generator)
+                    if batch_indices is None:
+                        break
+                    made_progress = True
+                    _run_indices(base_task, member, batch_indices.long())
+        if not made_progress:
+            break
+        warmup_cycle += 1
+
+    # Adaptive epochs
+    for epoch in range(sleep_cfg.epochs):
+        for base_name, members in groups.items():
+            base_task = members[0]
+            for member in members:
+                state = _get_state(member)
+                generator = torch.Generator().manual_seed(
+                    seed + epoch + base_task.column_index * 37 + member.column_index * 41
+                )
+                batches = state.plan_dynamic_batches(batch_size, dynamic_cfg, generator)
+                for batch_indices in batches:
+                    _run_indices(base_task, member, batch_indices.long())
 
 
 def _compute_error_overlap(
@@ -379,51 +584,64 @@ def _run_sleep_phase(
     seed = config.training.seed + 97
 
     if groups:
-        for epoch in range(sleep_cfg.epochs):
-            for base_name, members in groups.items():
-                base_task = members[0]
-                target_column = base_task.column_index
-                group_seed = seed + epoch + base_task.column_index * 17
+        if sleep_cfg.dynamic.enabled:
+            _run_dynamic_sleep(
+                model=model,
+                teacher=teacher,
+                groups=groups,
+                datasets=datasets,
+                controller=controller,
+                device=device,
+                sleep_cfg=sleep_cfg,
+                batch_size=batch_size,
+                seed=seed,
+            )
+        else:
+            for epoch in range(sleep_cfg.epochs):
+                for base_name, members in groups.items():
+                    base_task = members[0]
+                    target_column = base_task.column_index
+                    group_seed = seed + epoch + base_task.column_index * 17
 
-                replay_plan = []
-                for member in members:
-                    repeat = sleep_cfg.held_out_replay if member is not base_task else 1
-                    dataset = datasets[member.name]
-                    repeat_count = max(1, repeat)
-                    for repeat_idx in range(repeat_count):
-                        repeat_seed = group_seed + member.column_index * 997 + repeat_idx * 131
-                        replay_plan.append((member, dataset, repeat_seed))
+                    replay_plan = []
+                    for member in members:
+                        repeat = sleep_cfg.held_out_replay if member is not base_task else 1
+                        dataset = datasets[member.name]
+                        repeat_count = max(1, repeat)
+                        for repeat_idx in range(repeat_count):
+                            repeat_seed = group_seed + member.column_index * 997 + repeat_idx * 131
+                            replay_plan.append((member, dataset, repeat_seed))
 
-                if replay_plan:
-                    generator = torch.Generator().manual_seed(group_seed)
-                    order = torch.randperm(len(replay_plan), generator=generator).tolist()
-                else:
-                    order = []
+                    if replay_plan:
+                        generator = torch.Generator().manual_seed(group_seed)
+                        order = torch.randperm(len(replay_plan), generator=generator).tolist()
+                    else:
+                        order = []
 
-                for plan_idx in order:
-                    member, dataset, repeat_seed = replay_plan[plan_idx]
-                    for batch_features, batch_labels in _iterate_batches(
-                        dataset.train_features, dataset.train_labels, batch_size, repeat_seed
-                    ):
-                        student_mask = controller.build_mask(base_task.prompt).to(device)
-                        teacher_mask = controller.build_mask(member.prompt).to(device)
-                        regularization = controller.regularization_loss(base_task.name)
-                        if regularization is not None:
-                            regularization = regularization.to(device)
-                        _sleep_train_batch(
-                            model=model,
-                            teacher=teacher,
-                            batch_features=batch_features.to(device),
-                            batch_labels=batch_labels.to(device),
-                            student_mask=student_mask,
-                            teacher_mask=teacher_mask,
-                            target_column=target_column,
-                            teacher_column=member.column_index,
-                            cfg=sleep_cfg,
-                            controller=controller,
-                            task_name=base_task.name,
-                            regularization=regularization,
-                        )
+                    for plan_idx in order:
+                        member, dataset, repeat_seed = replay_plan[plan_idx]
+                        for batch_features, batch_labels in _iterate_batches(
+                            dataset.train_features, dataset.train_labels, batch_size, repeat_seed
+                        ):
+                            student_mask = controller.build_mask(base_task.prompt).to(device)
+                            teacher_mask = controller.build_mask(member.prompt).to(device)
+                            regularization = controller.regularization_loss(base_task.name)
+                            if regularization is not None:
+                                regularization = regularization.to(device)
+                            _sleep_train_batch(
+                                model=model,
+                                teacher=teacher,
+                                batch_features=batch_features.to(device),
+                                batch_labels=batch_labels.to(device),
+                                student_mask=student_mask,
+                                teacher_mask=teacher_mask,
+                                target_column=target_column,
+                                teacher_column=member.column_index,
+                                cfg=sleep_cfg,
+                                controller=controller,
+                                task_name=base_task.name,
+                                regularization=regularization,
+                            )
 
     metrics, post_sleep_predictions = _evaluate(
         model,

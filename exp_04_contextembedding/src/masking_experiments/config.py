@@ -82,6 +82,20 @@ class ExperimentConfig:
 
 
 @dataclass
+class SleepDynamicDistillationConfig:
+    """Adaptive replay configuration for the sleep phase."""
+
+    enabled: bool = False
+    warmup_passes: float = 1.0
+    top_percent: float = 0.3
+    extra_percent: float = 0.1
+    min_probability: float = 0.05
+    use_moving_average: bool = True
+    momentum: float = 0.9
+    initial_loss: float = 1.0
+
+
+@dataclass
 class SleepPhaseConfig:
     """Configuration for the optional sleep consolidation phase."""
 
@@ -92,6 +106,7 @@ class SleepPhaseConfig:
     distillation_weight: float = 0.5
     temperature: float = 2.0
     held_out_replay: int = 1
+    dynamic: SleepDynamicDistillationConfig = field(default_factory=SleepDynamicDistillationConfig)
 
 
 @dataclass
@@ -143,7 +158,12 @@ def load_config(path: str | Path) -> ExperimentConfig:
 
     model = ModelConfig(**raw.get("model", {}))
     sleep_cfg_raw = raw.get("sleep") or {}
-    sleep = SleepPhaseConfig(**sleep_cfg_raw) if sleep_cfg_raw else SleepPhaseConfig()
+    if sleep_cfg_raw:
+        dynamic_raw = sleep_cfg_raw.get("dynamic", {}) or {}
+        sleep_kwargs = {key: value for key, value in sleep_cfg_raw.items() if key != "dynamic"}
+        sleep = SleepPhaseConfig(**sleep_kwargs, dynamic=SleepDynamicDistillationConfig(**dynamic_raw))
+    else:
+        sleep = SleepPhaseConfig()
 
     return ExperimentConfig(
         name=raw.get("name", cfg_path.stem),
