@@ -439,20 +439,6 @@ def _run_dynamic_sleep(
     # Adaptive epochs
     similarity = {}
     context_vectors: Dict[str, torch.Tensor] = {}
-    if dynamic_cfg.similarity_influence > 0.0:
-        for base_name, members in groups.items():
-            for member in members:
-                if member.name not in context_vectors:
-                    context_vectors[member.name] = controller.context_vector(member.name).detach().cpu()
-        names = list(context_vectors.keys())
-        for i, name_a in enumerate(names):
-            vec_a = context_vectors[name_a].unsqueeze(0)
-            for name_b in names[i + 1 :]:
-                vec_b = context_vectors[name_b].unsqueeze(0)
-                sim = float(F.cosine_similarity(vec_a, vec_b, dim=-1).item())
-                sim = max(0.0, sim)
-                similarity[(name_a, name_b)] = sim
-                similarity[(name_b, name_a)] = sim
 
     for epoch in range(sleep_cfg.epochs):
         for base_name, members in groups.items():
@@ -464,17 +450,7 @@ def _run_dynamic_sleep(
                 )
                 batches = state.plan_dynamic_batches(batch_size, dynamic_cfg, generator)
                 for batch_indices in batches:
-                    losses = _run_indices(base_task, member, batch_indices.long())
-                    if dynamic_cfg.similarity_influence > 0.0 and losses.numel() > 0:
-                        mean_loss = float(losses.mean().item())
-                        for other_name, other_state in state_cache.items():
-                            if other_name == member.name:
-                                continue
-                            sim = similarity.get((member.name, other_name), 0.0)
-                            if sim <= 0.0:
-                                continue
-                            delta = dynamic_cfg.similarity_influence * sim * (mean_loss - 0.5)
-                            other_state.adjust_probability_bias(delta)
+                    _run_indices(base_task, member, batch_indices.long())
 
 
 def _compute_error_overlap(

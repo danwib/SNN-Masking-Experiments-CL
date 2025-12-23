@@ -84,4 +84,3 @@ sleep:
     use_moving_average: true
     momentum: 0.85
     initial_loss: 1.0
-    similarity_influence: 0.3
