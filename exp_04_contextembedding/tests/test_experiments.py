@@ -475,6 +475,26 @@ def test_stage5A1_config_runs_with_fake_data():
     assert labels[-1] == "after_sleep"
 
 
+def test_stage5A2_input_config_runs_with_fake_data():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "stage5A2_sequential_X_Xprime_soft_sleep_input.yaml"
+    )
+    config = load_config(config_path)
+    config.dataset.root = "tests/.fake_data"
+    config.dataset.use_fake_data = True
+    config.dataset.download = False
+    config.dataset.max_train_samples = 64
+    config.training.epochs = 1
+    config.training.batch_size = 16
+    config.training.base_learning_rate = 0.01
+    config.sleep.epochs = 1
+    config.sleep.batch_size = 16
+    result = run_experiment(config)
+    assert result.stages[-1].label == "after_sleep"
+
+
 def test_wake_training_changes_between_initial_and_after_task1(monkeypatch):
     features_zero = torch.zeros(16, 4)
     features_one = torch.ones(16, 4)

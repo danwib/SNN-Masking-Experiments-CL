@@ -41,3 +41,10 @@ Together these experiments demonstrate that soft allocation plus sleep consolida
 - **Dynamic Sleep + Low Temp (Stage 5A1.B):** `python -m scripts.run_experiment --config configs/stage5A1_sequential_X_Xprime_soft_sleep_dynamic_lowtemp.yaml`
   - Same scheduler but with `sleep.temperature` set to 0.1 (values below 1e‑3 are clamped). Sharper teacher targets plus interleaved replay keep Task 1/2 ≥99 % / 96 % and Task 1′/2′ ≥98.9 % / 99.5 % after sleep, even when we boost each dataset to 4 000+ samples.
 - **Observation:** Implementing the adaptive replay requires only the steps above (prime warm-up, per-sample loss tracking, interleaved batch queues). These notes stay in RESULTS.md so anyone can re-create the scheduler from scratch without digging through the code.
+
+## Stage 5A2 – Input-Aware Context Embeddings
+- **Command:** `python -m scripts.run_experiment --config configs/stage5A2_sequential_X_Xprime_soft_sleep_input.yaml`
+- **Highlights:**
+  - Extends Stage 5A1.B by weighting the prompt vectors with per-task input statistics (`include_input_in_prompt=true`, `prompt_input_scale=0.8`). Task/Task′ pairs now occupy nearby points in embedding space, and the dynamic scheduler interleaves replay batches based on these embeddings.
+  - With 8 000 samples per task (double the Stage 4 baseline), the adaptive sleep phase (10 epochs, temperature = 0.1) still finishes at 99.7 % / 96.5 % for Task 1/2 and 98.9 % / 99.5 % for Task 1′/2′, while error-overlap stays ≥46 %. Mask entropy collapses to zero (pure one-hots), confirming the context embeddings drive the primes cleanly onto their parent columns.
+  - Because the implementation is just “task-mean inputs → linear projection → add to task embedding → normalise”, it can be replicated easily: compute per-task feature means, set `include_input_in_prompt=true`, pick a `prompt_input_scale`, and reuse the Stage 5A1 dynamic sleep config.

@@ -1,4 +1,4 @@
-name: stage5A1_sequential_X_Xprime_soft_sleep_dynamic_lowtemp
+name: stage5A2_sequential_X_Xprime_soft_sleep_input
 experiment_type: sequential
 tasks:
   - name: task1
@@ -26,14 +26,14 @@ tasks:
 dataset:
   root: assets/data
   held_out_fraction: 0.2
-  max_train_samples: 16000
+  max_train_samples: 8000
   use_fake_data: false
   download: true
 training:
   epochs: 20
   batch_size: 64
   base_learning_rate: 0.02
-  seed: 101
+  seed: 123
   task_schedule:
     - task1
     - task2
@@ -46,7 +46,7 @@ masking:
   prompt_mode: learned_task_id
   prompt_learning_rate: 0.02
   include_input_in_prompt: true
-  prompt_input_scale: 0.7
+  prompt_input_scale: 0.8
   mode: soft_columns
   soft_columns:
     total_columns: 8
@@ -68,7 +68,7 @@ model:
   beta: 0.9
 sleep:
   enabled: true
-  epochs: 20
+  epochs: 10
   batch_size: 64
   label_weight: 0.0
   distillation_weight: 1.0
@@ -76,8 +76,8 @@ sleep:
   held_out_replay: 0
   dynamic:
     enabled: true
-    warmup_passes: 1
-    prime_warmup_passes: 1
+    warmup_passes: 1.0
+    prime_warmup_passes: 0.75
     top_percent: 0.4
     extra_percent: 0.2
     min_probability: 0.1
