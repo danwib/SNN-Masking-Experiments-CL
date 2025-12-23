@@ -307,8 +307,8 @@ def _sleep_train_batch(
     model.train()
     student_outputs = model.forward(batch_features, student_mask)
     student_logits = model._select_logits(student_outputs, student_mask, target_column)
-    temperature = max(cfg.temperature, 1e-3)
-    distill_scale = _distillation_scale(cfg.temperature)
+    temperature = max(cfg.temperature, 0.1)
+    distill_scale = _distillation_scale(temperature)
     label_losses = F.binary_cross_entropy_with_logits(student_logits, batch_labels, reduction="none")
 
     with torch.no_grad():
@@ -332,8 +332,7 @@ def _sleep_train_batch(
 
 
 def _distillation_scale(temperature: float) -> float:
-    adjusted = max(temperature, 1e-3)
-    return adjusted**2 if adjusted >= 1.0 else 1.0
+    return temperature**2
 
 
 def _run_dynamic_sleep(
@@ -449,13 +448,30 @@ def _run_dynamic_sleep(
                 generator=torch.Generator().manual_seed(seed + 2000 + epoch + base_task.column_index * 67),
             )
             _replay_sequence(base_task, base_task, base_order)
+
+            member_batches: List[tuple[TaskConfig, List[torch.Tensor]]] = []
             for member in members:
                 state = _get_state(member)
                 generator = torch.Generator().manual_seed(
                     seed + epoch + base_task.column_index * 37 + member.column_index * 41
                 )
                 batches = state.plan_dynamic_batches(batch_size, dynamic_cfg, generator)
-                for batch_indices in batches:
+                member_batches.append((member, batches))
+
+            positions = [0 for _ in member_batches]
+            local_seed = torch.Generator().manual_seed(seed + 2500 + epoch + base_task.column_index * 73)
+            while True:
+                active_indices = [idx for idx, (_, batch_list) in enumerate(member_batches) if positions[idx] < len(batch_list)]
+                if not active_indices:
+                    break
+                order = torch.randperm(len(active_indices), generator=local_seed).tolist()
+                for ord_idx in order:
+                    member_idx = active_indices[ord_idx]
+                    member, batch_list = member_batches[member_idx]
+                    if positions[member_idx] >= len(batch_list):
+                        continue
+                    batch_indices = batch_list[positions[member_idx]]
+                    positions[member_idx] += 1
                     _run_indices(base_task, member, batch_indices.long())
 
 
