@@ -26,11 +26,11 @@ tasks:
 dataset:
   root: assets/data
   held_out_fraction: 0.2
-  max_train_samples: 16000
+  max_train_samples: 32000
   use_fake_data: false
   download: true
 training:
-  epochs: 20
+  epochs: 10
   batch_size: 64
   base_learning_rate: 0.02
   seed: 123
@@ -68,7 +68,7 @@ model:
   beta: 0.9
 sleep:
   enabled: true
-  epochs: 10
+  epochs: 5
   batch_size: 64
   label_weight: 0.0
   distillation_weight: 1.0
@@ -84,3 +84,5 @@ sleep:
     use_moving_average: true
     momentum: 0.85
     initial_loss: 1.0
+    gradient_similarity_influence: 0.2     # or whatever scale you want
+    gradient_update_interval: 5
