@@ -443,6 +443,12 @@ def _run_dynamic_sleep(
     for epoch in range(sleep_cfg.epochs):
         for base_name, members in groups.items():
             base_task = members[0]
+            base_dataset = datasets[base_task.name]
+            base_order = torch.randperm(
+                base_dataset.train_features.shape[0],
+                generator=torch.Generator().manual_seed(seed + 2000 + epoch + base_task.column_index * 67),
+            )
+            _replay_sequence(base_task, base_task, base_order)
             for member in members:
                 state = _get_state(member)
                 generator = torch.Generator().manual_seed(
