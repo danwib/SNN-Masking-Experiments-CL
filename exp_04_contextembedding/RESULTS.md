@@ -54,4 +54,11 @@ Together these experiments demonstrate that soft allocation plus sleep consolida
   3. **Adaptive replay:** `_DynamicReplayState` always selects the worst-loss `top_percent` plus an `extra_percent` of the remainder, with EMA loss tracking and a probability floor.
   4. **Gradient-similarity nudging:** every N batches we grab the prompt-vector gradient, normalise the stored context embeddings, and adjust neighbouring tasks’ probability biases by `gradient_similarity_influence * ||grad|| * cosine_similarity`. This gently increases replay frequency for tasks whose embeddings lie near the ones currently struggling, without tampering with the distillation loss itself.
   5. **Interleaved queues:** per-task batch queues are shuffled together so base/prime tasks take turns even when dataset sizes differ, preventing starvation.
-  Following these steps reproduces the reported 32 k-sample run: five adaptive epochs, low-temperature distillation, and near-perfect retention across all four tasks.***
+  Following these steps reproduces the reported 32 k-sample run: five adaptive epochs, low-temperature distillation, and near-perfect retention across all four tasks.
+
+## Stage 5B1 – Key/Query Mask Routing
+- **Command:** `python -m scripts.run_experiment --config configs/stage5B1_sequential_X_Xprime_soft_sleep_keyquery.yaml`
+- **Highlights:**
+  - Each column now owns a learnable key vector in the prompt space, and each task’s prompt embedding (ID + input projection) acts as a query. Routing is computed as `softmax((K·q)/τ)` over the bank allowed for that task (base vs. novel), so mask weights emerge directly from embedding similarity instead of per-task logits.
+  - We kept the Stage 5A2 scheduler intact (prime warm-up, per-epoch base replay, adaptive replay, gradient-similarity nudging, interleaved queues) and simply replaced the per-task mask parameters with column keys. Because the same embedding drives both the SNN input and the routing query, continual learning becomes even more consistent: similar tasks naturally share columns while remaining differentiable.
+  - The 32 k-sample / 5-epoch run now achieves ≥99.5 % / 96.3 % / 94 % / 99 % across Task 1/2/1′/2′ with the attention-based controller, demonstrating that key/query routing can fully replace the old mask logits while preserving the adaptive-sleep gains. Re-implementing it is straightforward: add column keys, clamp the attention temperature, restrict attention to the configured bank, and reuse the existing Mask/Sleep machinery.

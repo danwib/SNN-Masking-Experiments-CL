@@ -46,6 +46,15 @@ class TrainingConfig:
 
 
 @dataclass
+class KeyQueryRoutingConfig:
+    """Configuration for key/query-based mask routing."""
+
+    enabled: bool = False
+    temperature: float = 0.2
+    init_scale: float = 0.1
+
+
+@dataclass
 class MaskingConfig:
     """How masks affect neuron dynamics."""
 
@@ -58,6 +67,7 @@ class MaskingConfig:
     prompt_input_scale: float = 1.0
     mode: str = "hard_columns"
     soft_columns: "SoftColumnMaskConfig" = field(default_factory=lambda: SoftColumnMaskConfig())
+    key_query: KeyQueryRoutingConfig = field(default_factory=KeyQueryRoutingConfig)
 
 
 @dataclass
@@ -159,8 +169,13 @@ def load_config(path: str | Path) -> ExperimentConfig:
     masking_raw = raw.get("masking", {})
     soft_columns_raw = masking_raw.get("soft_columns", {})
     soft_columns_cfg = SoftColumnMaskConfig(**soft_columns_raw)
-    masking_kwargs = {key: value for key, value in masking_raw.items() if key != "soft_columns"}
-    masking = MaskingConfig(**masking_kwargs, soft_columns=soft_columns_cfg)
+    key_query_raw = masking_raw.get("key_query", {}) or {}
+    masking_kwargs = {key: value for key, value in masking_raw.items() if key not in {"soft_columns", "key_query"}}
+    masking = MaskingConfig(
+        **masking_kwargs,
+        soft_columns=soft_columns_cfg,
+        key_query=KeyQueryRoutingConfig(**key_query_raw),
+    )
 
     model = ModelConfig(**raw.get("model", {}))
     sleep_cfg_raw = raw.get("sleep") or {}
@@ -181,3 +196,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
         model=model,
         sleep=sleep,
     )
+@dataclass
+class KeyQueryRoutingConfig:
+    """Configuration for key/query-based mask routing."""
+
+    enabled: bool = False
+    temperature: float = 0.2
+    init_scale: float = 0.1

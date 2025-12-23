@@ -9,6 +9,7 @@ from masking_experiments.config import (
     ExperimentConfig,
     MaskingConfig,
     ModelConfig,
+    KeyQueryRoutingConfig,
     SleepPhaseConfig,
     SleepDynamicDistillationConfig,
     SoftColumnMaskConfig,
@@ -23,7 +24,7 @@ from masking_experiments.experiments import (
     _distillation_scale,
     _apply_gradient_influence,
 )
-from masking_experiments.masking import MaskController
+from masking_experiments.masking import MaskController, SoftColumnMaskController
 from masking_experiments.snn import SparseSNN
 
 
@@ -372,6 +373,36 @@ def test_soft_column_sleep_reports_masks():
     assert after_stage.mask_logs is not None and "_occupancy" in after_stage.mask_logs
 
 
+def test_soft_column_key_query_masks_behave():
+    tasks = _base_tasks()[:2]
+    tasks[0].task_id = 0
+    tasks[1].task_id = 1
+    masking_cfg = MaskingConfig(
+        learning_rate_scale=0.2,
+        threshold_shift=0.3,
+        prompt_vector_dim=8,
+        prompt_mode="learned_task_id",
+        mode="soft_columns",
+        key_query=KeyQueryRoutingConfig(enabled=True, temperature=0.5, init_scale=0.1),
+        soft_columns=SoftColumnMaskConfig(
+            total_columns=4,
+            base_columns=2,
+            base_tasks=["Task 1"],
+            novel_tasks=["Task 2"],
+            mask_learning_rate=0.05,
+        ),
+    )
+    controller = SoftColumnMaskController(tasks, masking_cfg)
+    mask_task1 = controller.build_mask("Task 1")
+    assert torch.isclose(mask_task1.column_mask.sum(), torch.tensor(1.0))
+    assert torch.allclose(mask_task1.column_mask[2:], torch.zeros(2), atol=1e-5)
+    controller.zero_grad()
+    loss = mask_task1.column_mask.sum()
+    loss.backward()
+    assert controller.column_keys.grad is not None
+    controller.apply_gradients("Task 1")
+
+
 def test_mixed_mnist_and_fashion_tasks_run():
     config = ExperimentConfig(
         name="mnist_fashion_mix",
@@ -485,6 +516,26 @@ def test_stage5A2_input_config_runs_with_fake_data():
         Path(__file__).resolve().parents[1]
         / "configs"
         / "stage5A2_sequential_X_Xprime_soft_sleep_input.yaml"
+    )
+    config = load_config(config_path)
+    config.dataset.root = "tests/.fake_data"
+    config.dataset.use_fake_data = True
+    config.dataset.download = False
+    config.dataset.max_train_samples = 64
+    config.training.epochs = 1
+    config.training.batch_size = 16
+    config.training.base_learning_rate = 0.01
+    config.sleep.epochs = 1
+    config.sleep.batch_size = 16
+    result = run_experiment(config)
+    assert result.stages[-1].label == "after_sleep"
+
+
+def test_stage5B1_key_query_config_runs_with_fake_data():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "stage5B1_sequential_X_Xprime_soft_sleep_keyquery.yaml"
     )
     config = load_config(config_path)
     config.dataset.root = "tests/.fake_data"

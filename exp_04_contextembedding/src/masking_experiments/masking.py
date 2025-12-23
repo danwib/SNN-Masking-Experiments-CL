@@ -219,11 +219,18 @@ class SoftColumnMaskController(nn.Module):
         for name, bank in self._task_to_bank.items():
             self._bank_to_tasks[bank].append(name)
 
+        self.use_key_query = config.key_query.enabled
         self.logits = nn.ParameterDict()
-        for name, bank in self._task_to_bank.items():
-            size = self._bank_size(bank)
-            param = nn.Parameter(torch.zeros(size))
-            self.logits[name] = param
+        if self.use_key_query:
+            self.key_temperature = max(config.key_query.temperature, 1e-3)
+            self.column_keys = nn.Parameter(
+                torch.randn(self.total_columns, config.prompt_vector_dim) * config.key_query.init_scale
+            )
+        else:
+            for name, bank in self._task_to_bank.items():
+                size = self._bank_size(bank)
+                param = nn.Parameter(torch.zeros(size))
+                self.logits[name] = param
 
     def _bank_size(self, bank: str) -> int:
         return self.base_columns if bank == "base" else self.novel_columns
@@ -247,6 +254,8 @@ class SoftColumnMaskController(nn.Module):
         return weights.detach() if detach else weights
 
     def _full_mask(self, task_name: str, detach: bool) -> torch.Tensor:
+        if self.use_key_query:
+            raise RuntimeError("full_mask should not be called when key-query routing is enabled.")
         bank = self._task_to_bank[task_name]
         param = self.logits[task_name]
         mask = torch.zeros(self.total_columns, device=param.device, dtype=param.dtype)
@@ -254,23 +263,48 @@ class SoftColumnMaskController(nn.Module):
         mask[self._bank_slice(bank)] = bank_mask
         return mask
 
+    def _key_query_mask(self, task: TaskConfig, prompt_vec: torch.Tensor, detach: bool) -> torch.Tensor:
+        scores = torch.matmul(self.column_keys, prompt_vec)
+        scaled = scores / self.key_temperature
+        mask = torch.full_like(scaled, float("-inf"))
+        bank_slice = self._bank_slice(self._task_to_bank[task.name])
+        mask[bank_slice] = scaled[bank_slice]
+        weights = F.softmax(mask, dim=-1)
+        return weights.detach() if detach else weights
+
     def build_mask(self, context: str) -> Mask:
         task = self.resolve_task(context)
+        if self.use_key_query:
+            prompt_vec = self._context_vector(task).to(self.column_keys.device)
+            full_mask = self._key_query_mask(task, prompt_vec, detach=False)
+            lr_mask = full_mask.detach()
+            threshold_shift = torch.zeros(self.total_columns, device=full_mask.device, dtype=full_mask.dtype)
+            return Mask(
+                learning_rate_scale=lr_mask,
+                threshold_shift=threshold_shift,
+                prompt_vector=prompt_vec.to(full_mask.device),
+                column_mask=full_mask,
+            )
+        prompt_vec = self._context_vector(task)
         full_mask = self._full_mask(task.name, detach=False)
         lr_mask = full_mask.detach()
         threshold_shift = torch.zeros(self.total_columns, device=full_mask.device, dtype=full_mask.dtype)
-        prompt_vec = self._context_vector(task).to(full_mask.device)
         return Mask(
             learning_rate_scale=lr_mask,
             threshold_shift=threshold_shift,
-            prompt_vector=prompt_vec,
+            prompt_vector=prompt_vec.to(full_mask.device),
             column_mask=full_mask,
         )
 
     def regularization_loss(self, task_name: str) -> torch.Tensor | None:
         penalties: Optional[torch.Tensor] = None
         bank = self._task_to_bank[task_name]
-        bank_mask = self._distribution(task_name, detach=False)
+        if self.use_key_query:
+            task = self._tasks_by_name[task_name]
+            full = self._key_query_mask(task, self._context_vector(task).to(self.column_keys.device), detach=False)
+            bank_mask = full[self._bank_slice(bank)]
+        else:
+            bank_mask = self._distribution(task_name, detach=False)
         if self.lambda_entropy > 0.0:
             entropy = -(bank_mask * (bank_mask + 1e-8).log()).sum()
             penalties = entropy * self.lambda_entropy
@@ -283,7 +317,14 @@ class SoftColumnMaskController(nn.Module):
             for other_name in self._bank_to_tasks.get("novel", []):
                 if other_name == task_name:
                     continue
-                other_mask = self._distribution(other_name, detach=True)
+                if self.use_key_query:
+                    other_task = self._tasks_by_name[other_name]
+                    other_full = self._key_query_mask(
+                        other_task, self._context_vector(other_task).to(self.column_keys.device), detach=True
+                    )
+                    other_mask = other_full[self._bank_slice("novel")]
+                else:
+                    other_mask = self._distribution(other_name, detach=True)
                 overlaps.append(torch.dot(bank_mask, other_mask))
             if overlaps:
                 overlap_value = torch.stack(overlaps).mean()
@@ -295,21 +336,30 @@ class SoftColumnMaskController(nn.Module):
         if self.mask_learning_rate <= 0.0:
             self.prompt_vectors.apply_gradients()
             return
-        names = [task_name] if task_name else list(self.logits.keys())
-        for name in names:
-            param = self.logits[name]
-            if param.grad is None:
-                continue
-            param.data -= self.mask_learning_rate * param.grad
+        if self.use_key_query:
+            if self.column_keys.grad is not None:
+                self.column_keys.data -= self.mask_learning_rate * self.column_keys.grad
+        else:
+            names = [task_name] if task_name else list(self.logits.keys())
+            for name in names:
+                param = self.logits[name]
+                if param.grad is None:
+                    continue
+                param.data -= self.mask_learning_rate * param.grad
         self.prompt_vectors.apply_gradients()
 
     def zero_grad(self, task_name: str | None = None) -> None:
-        names = [task_name] if task_name else list(self.logits.keys())
-        for name in names:
-            param = self.logits[name]
-            if param.grad is not None:
-                param.grad.detach_()
-                param.grad.zero_()
+        if self.use_key_query:
+            if self.column_keys.grad is not None:
+                self.column_keys.grad.detach_()
+                self.column_keys.grad.zero_()
+        else:
+            names = [task_name] if task_name else list(self.logits.keys())
+            for name in names:
+                param = self.logits[name]
+                if param.grad is not None:
+                    param.grad.detach_()
+                    param.grad.zero_()
         self.prompt_vectors.zero_grad()
 
     def get_masks_dict(self, prompt_overrides: Optional[Dict[str, str]] = None) -> Dict[str, torch.Tensor]:
@@ -319,7 +369,11 @@ class SoftColumnMaskController(nn.Module):
             for task_name, task in self._tasks_by_name.items():
                 context = overrides.get(task_name, task.prompt)
                 context_task = self.resolve_task(context)
-                mask = self._full_mask(context_task.name, detach=True)
+                if self.use_key_query:
+                    vec = self._context_vector(context_task).to(self.column_keys.device)
+                    mask = self._key_query_mask(context_task, vec, detach=True)
+                else:
+                    mask = self._full_mask(context_task.name, detach=True)
                 masks[task_name] = mask.cpu()
         return masks
 
@@ -331,7 +385,11 @@ class SoftColumnMaskController(nn.Module):
                 context = overrides.get(task_name, task.prompt)
                 context_task = self.resolve_task(context)
                 bank = self._task_to_bank[context_task.name]
-                bank_mask = self._distribution(context_task.name, detach=True)
+                if self.use_key_query:
+                    vec = self._context_vector(context_task).to(self.column_keys.device)
+                    bank_mask = self._key_query_mask(context_task, vec, detach=True)[self._bank_slice(bank)]
+                else:
+                    bank_mask = self._distribution(context_task.name, detach=True)
                 occupancy[bank].append(bank_mask.cpu())
         averaged: Dict[str, torch.Tensor] = {}
         for bank, entries in occupancy.items():
