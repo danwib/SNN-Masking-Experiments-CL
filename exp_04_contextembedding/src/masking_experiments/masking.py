@@ -226,9 +226,17 @@ class SoftColumnMaskController(nn.Module):
         self.logits = nn.ParameterDict()
         if self.use_key_query:
             self.key_temperature = max(config.key_query.temperature, 1e-3)
+            self.locked_temperature = max(config.key_query.locked_temperature, 1e-3)
+            self.assignment_threshold = config.key_query.assignment_threshold
+            self.occupied_penalty = config.key_query.occupied_penalty
+            self.lock_bonus = config.key_query.lock_bonus
+            self.margin = config.key_query.margin
+            self.margin_weight = config.key_query.margin_weight
             self.column_keys = nn.Parameter(
                 torch.randn(self.total_columns, config.prompt_vector_dim) * config.key_query.init_scale
             )
+            self._task_assignment: Dict[str, int] = {}
+            self._column_assignments: Dict[int, str] = {}
         else:
             for name, bank in self._task_to_bank.items():
                 size = self._bank_size(bank)
@@ -268,11 +276,31 @@ class SoftColumnMaskController(nn.Module):
 
     def _key_query_mask(self, task: TaskConfig, prompt_vec: torch.Tensor, detach: bool) -> torch.Tensor:
         scores = torch.matmul(self.column_keys, prompt_vec)
-        scaled = scores / self.key_temperature
-        mask = torch.full_like(scaled, float("-inf"))
-        bank_slice = self._bank_slice(self._task_to_bank[task.name])
-        mask[bank_slice] = scaled[bank_slice]
+        bank = self._task_to_bank[task.name]
+        bank_slice = self._bank_slice(bank)
+        # Apply occupied penalty to columns already claimed by other tasks within this bank.
+        if self.occupied_penalty > 0.0:
+            for col_idx, owner in self._column_assignments.items():
+                if owner != task.name and bank_slice.start <= col_idx < bank_slice.stop:
+                    scores[col_idx] -= self.occupied_penalty
+        assigned_idx = self._task_assignment.get(task.name)
+        temperature = self.key_temperature
+        if assigned_idx is not None:
+            temperature = self.locked_temperature
+            scores[assigned_idx] += self.lock_bonus
+        mask = torch.full_like(scores, float("-inf"))
+        mask[bank_slice] = scores[bank_slice] / temperature
         weights = F.softmax(mask, dim=-1)
+        if not detach:
+            with torch.no_grad():
+                slice_weights = weights[bank_slice]
+                best_value, best_idx = torch.max(slice_weights, dim=0)
+                if float(best_value.item()) >= self.assignment_threshold:
+                    global_idx = bank_slice.start + int(best_idx.item())
+                    owner = self._column_assignments.get(global_idx)
+                    if owner in (None, task.name):
+                        self._column_assignments[global_idx] = task.name
+                        self._task_assignment[task.name] = global_idx
         return weights.detach() if detach else weights
 
     def build_mask(self, context: str) -> Mask:
@@ -315,24 +343,35 @@ class SoftColumnMaskController(nn.Module):
             uniform = torch.full_like(bank_mask, 1.0 / max(1, bank_mask.numel()))
             balance = F.mse_loss(bank_mask, uniform)
             penalties = balance * self.lambda_balance if penalties is None else penalties + balance * self.lambda_balance
-        if self.lambda_overlap_novel > 0.0 and bank == "novel":
+        if self.lambda_overlap_novel > 0.0 and bank == "novel" and not self.use_key_query:
             overlaps = []
             for other_name in self._bank_to_tasks.get("novel", []):
                 if other_name == task_name:
                     continue
-                if self.use_key_query:
-                    other_task = self._tasks_by_name[other_name]
-                    other_full = self._key_query_mask(
-                        other_task, self._context_vector(other_task).to(self.column_keys.device), detach=True
-                    )
-                    other_mask = other_full[self._bank_slice("novel")]
-                else:
-                    other_mask = self._distribution(other_name, detach=True)
+                other_mask = self._distribution(other_name, detach=True)
                 overlaps.append(torch.dot(bank_mask, other_mask))
             if overlaps:
                 overlap_value = torch.stack(overlaps).mean()
                 overlap_term = overlap_value * self.lambda_overlap_novel
                 penalties = overlap_term if penalties is None else penalties + overlap_term
+        if self.use_key_query and self.margin > 0.0 and task_name in self._task_assignment:
+            assigned_idx = self._task_assignment.get(task_name)
+            if assigned_idx is not None:
+                task = self._tasks_by_name[task_name]
+                vec = self._context_vector(task).to(self.column_keys.device)
+                scores = torch.matmul(self.column_keys, vec)
+                bank_slice = self._bank_slice(bank)
+                if bank_slice.start <= assigned_idx < bank_slice.stop:
+                    local_scores = scores[bank_slice]
+                    assigned_local = assigned_idx - bank_slice.start
+                    if local_scores.numel() > 1:
+                        mask = torch.ones_like(local_scores, dtype=torch.bool)
+                        mask[assigned_local] = False
+                        max_other = local_scores[mask].max()
+                        diff = local_scores[assigned_local] - max_other
+                        hinge = torch.relu(self.margin - diff)
+                        if hinge.item() > 0:
+                            penalties = hinge * self.margin_weight if penalties is None else penalties + hinge * self.margin_weight
         return penalties
 
     def apply_gradients(self, task_name: str | None = None) -> None:
