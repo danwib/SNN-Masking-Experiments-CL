@@ -138,9 +138,6 @@ class MaskController:
         self._prompt_vectors.to(device)
         return self
 
-    def promote_to_base(self, task_names: Sequence[str]) -> None:
-        return
-
     def context_vector(self, task_name: str) -> torch.Tensor:
         task = self._tasks_by_name[task_name]
         return self._context_vector(task).detach()
@@ -227,11 +224,14 @@ class SoftColumnMaskController(nn.Module):
         if self.use_key_query:
             self.key_temperature = max(config.key_query.temperature, 1e-3)
             self.locked_temperature = max(config.key_query.locked_temperature, 1e-3)
+            self.novel_temperature = max(config.key_query.novel_temperature, 1e-3)
             self.assignment_threshold = config.key_query.assignment_threshold
             self.occupied_penalty = config.key_query.occupied_penalty
             self.lock_bonus = config.key_query.lock_bonus
             self.margin = config.key_query.margin
             self.margin_weight = config.key_query.margin_weight
+            self.novel_entropy_weight = config.key_query.novel_entropy_weight
+            self.base_regularization_scale = config.key_query.base_regularization
             self.column_keys = nn.Parameter(
                 torch.randn(self.total_columns, config.prompt_vector_dim) * config.key_query.init_scale
             )
@@ -285,6 +285,8 @@ class SoftColumnMaskController(nn.Module):
                     scores[col_idx] -= self.occupied_penalty
         assigned_idx = self._task_assignment.get(task.name)
         temperature = self.key_temperature
+        if bank == "novel":
+            temperature = self.novel_temperature
         if assigned_idx is not None:
             temperature = self.locked_temperature
             scores[assigned_idx] += self.lock_bonus
@@ -339,6 +341,13 @@ class SoftColumnMaskController(nn.Module):
         if self.lambda_entropy > 0.0:
             entropy = -(bank_mask * (bank_mask + 1e-8).log()).sum()
             penalties = entropy * self.lambda_entropy
+        if self.use_key_query and bank == "novel" and self.novel_entropy_weight > 0.0:
+            entropy = -(bank_mask * (bank_mask + 1e-8).log()).sum()
+            penalties = (
+                entropy * self.novel_entropy_weight
+                if penalties is None
+                else penalties + entropy * self.novel_entropy_weight
+            )
         if self.lambda_balance > 0.0:
             uniform = torch.full_like(bank_mask, 1.0 / max(1, bank_mask.numel()))
             balance = F.mse_loss(bank_mask, uniform)
@@ -372,6 +381,22 @@ class SoftColumnMaskController(nn.Module):
                         hinge = torch.relu(self.margin - diff)
                         if hinge.item() > 0:
                             penalties = hinge * self.margin_weight if penalties is None else penalties + hinge * self.margin_weight
+        if self.use_key_query and bank == "base" and self.base_regularization_scale > 0.0:
+            assignments = [
+                name for name, owner_idx in self._task_assignment.items() if self._task_to_bank.get(name) == "base"
+            ]
+            for other_name in assignments:
+                if other_name == task_name:
+                    continue
+                other_task = self._tasks_by_name[other_name]
+                vec = self._context_vector(other_task).to(self.column_keys.device)
+                vec_self = self._context_vector(task).to(self.column_keys.device)
+                cosine = torch.clamp(torch.dot(vec, vec_self) / (vec.norm() * vec_self.norm() + 1e-8), -1.0, 1.0)
+                penalties = (
+                    torch.relu(cosine) * self.base_regularization_scale
+                    if penalties is None
+                    else penalties + torch.relu(cosine) * self.base_regularization_scale
+                )
         return penalties
 
     def apply_gradients(self, task_name: str | None = None) -> None:

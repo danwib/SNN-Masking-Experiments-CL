@@ -255,6 +255,7 @@ def _train_task(
     epochs: int,
     seed: int,
     device: torch.device,
+    lr_scale: float = 1.0,
 ) -> None:
     for epoch in range(epochs):
         epoch_seed = seed + epoch
@@ -271,6 +272,7 @@ def _train_task(
                 task_name=task.name,
                 mask_controller=controller,
                 regularization=reg,
+                lr_override=lr_scale,
             )
 
 
@@ -651,15 +653,22 @@ def _run_sequential(
     for task_name_idx, task_name in enumerate(schedule):
         if task_name not in name_to_task:
             continue
+        task_cfg = name_to_task[task_name]
+        is_novel_bank = hasattr(controller, "_task_to_bank") and controller._task_to_bank.get(task_name) == "novel"
+        if is_novel_bank:
+            lr_scale = config.training.base_lr_scale_during_novel
+        else:
+            lr_scale = 1.0
         _train_task(
             model=model,
-            task=name_to_task[task_name],
+            task=task_cfg,
             dataset=datasets[task_name],
             controller=controller,
             batch_size=config.training.batch_size,
             epochs=config.training.epochs,
             seed=config.training.seed,
             device=device,
+            lr_scale=lr_scale if not config.training.freeze_base_during_novel or not is_novel_bank else 0.0,
         )
         metrics = _evaluate(model, datasets, tasks, controller, device)
         mask_logs = _snapshot_masks(controller)

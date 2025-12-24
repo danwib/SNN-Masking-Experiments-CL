@@ -47,6 +47,8 @@ class TrainingConfig:
     sleep_promotions: Dict[str, List[str]] = field(default_factory=dict)
     final_sleep: bool = True
 
+    base_lr_scale_during_novel: float = 1.0
+    freeze_base_during_novel: bool = False
 @dataclass
 class KeyQueryRoutingConfig:
     """Configuration for key/query-based mask routing."""
@@ -55,11 +57,14 @@ class KeyQueryRoutingConfig:
     temperature: float = 0.2
     init_scale: float = 0.1
     locked_temperature: float = 0.05
+    novel_temperature: float = 0.05
     assignment_threshold: float = 0.75
     occupied_penalty: float = 1.0
     lock_bonus: float = 0.5
     margin: float = 0.2
     margin_weight: float = 1.0
+    base_regularization: float = 0.0
+    novel_entropy_weight: float = 0.5
 
 
 @dataclass
