@@ -42,6 +42,13 @@ Together these experiments demonstrate that soft allocation plus sleep consolida
   - Same scheduler but with `sleep.temperature` set to 0.1 (values below 1e‑3 are clamped). Sharper teacher targets plus interleaved replay keep Task 1/2 ≥99 % / 96 % and Task 1′/2′ ≥98.9 % / 99.5 % after sleep, even when we boost each dataset to 4 000+ samples.
 - **Observation:** Implementing the adaptive replay requires only the steps above (prime warm-up, per-sample loss tracking, interleaved batch queues). These notes stay in RESULTS.md so anyone can re-create the scheduler from scratch without digging through the code.
 
+## Stage 5B0 – Key/Query Routing (Static Baseline)
+- **Command:** `python -m scripts.run_experiment --config configs/stage5B0_sequential_X_Xprime_soft_sleep_keyquery_static.yaml`
+- **Highlights:**
+  - This is a pure routing swap over the Stage 5A1 schedule: we keep the prompt embeddings (task-id + optional input projection) exactly as-is, but replace the per-task mask logits with column keys and query attention. No prime warm-up, no adaptive replay, no gradient-similarity nudging—just the standard Task 1 → Task 2 → Task 1′ → Task 2′ → sleep sequence on SplitMNIST.
+  - Base tasks sit in the base bank, primes sit in the novel bank (`consolidate_into` maps the primes back to parents). After sleep the prompt overrides collapse the primes onto the parent columns just like Stage 4.
+  - The goal of this run is to answer “Does key/query routing work as a drop-in replacement when the context embeddings are already good?”—the answer is yes: accuracy and error-overlap match the Stage 5A1 baseline (e.g., Task 1≈99.7 %, Task 2≈96.2 %, Task 1′≈96.3 %, Task 2′≈99.7 % after sleep) while giving us the benefits of learned routing, albeit with much longer sleep (80 epochs) compared to the adaptive Stage 5B1 variants.
+
 ## Stage 5A2 – Input-Aware Context Embeddings
 - **Command:** `python -m scripts.run_experiment --config configs/stage5A2_sequential_X_Xprime_soft_sleep_input.yaml`
 - **Highlights:**
