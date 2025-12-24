@@ -47,6 +47,8 @@ training:
       - task1
       - task2
   final_sleep: false
+  base_lr_scale_during_novel: 0.1   # fully freeze base, or e.g. 0.2 for partial updates
+  freeze_base_during_novel: false    # optional convenience flag
 masking:
   learning_rate_scale: 0.35
   threshold_shift: 0.2
@@ -59,6 +61,8 @@ masking:
     enabled: true
     temperature: 0.2
     init_scale: 0.05
+    novel_entropy_weight: 0.5      # stronger penalty = sharper novel masks
+    base_regularization: 0.2       # cosine penalty to keep base keys separated
   mode: soft_columns
   soft_columns:
     total_columns: 8

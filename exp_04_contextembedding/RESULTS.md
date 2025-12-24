@@ -62,3 +62,23 @@ Together these experiments demonstrate that soft allocation plus sleep consolida
   - Each column now owns a learnable key vector in the prompt space, and each task’s prompt embedding (ID + input projection) acts as a query. Routing is computed as `softmax((K·q)/τ)` over the bank allowed for that task (base vs. novel), so mask weights emerge directly from embedding similarity instead of per-task logits.
   - We kept the Stage 5A2 scheduler intact (prime warm-up, per-epoch base replay, adaptive replay, gradient-similarity nudging, interleaved queues) and simply replaced the per-task mask parameters with column keys. Because the same embedding drives both the SNN input and the routing query, continual learning becomes even more consistent: similar tasks naturally share columns while remaining differentiable.
   - The 32 k-sample / 5-epoch run now achieves ≥99.5 % / 96.3 % / 94 % / 99 % across Task 1/2/1′/2′ with the attention-based controller, demonstrating that key/query routing can fully replace the old mask logits while preserving the adaptive-sleep gains. Re-implementing it is straightforward: add column keys, clamp the attention temperature, restrict attention to the configured bank, and reuse the existing Mask/Sleep machinery.
+- **Drift-Resistant Variant (Stage 5B1.2):**
+  - **Command:** `python -m scripts.run_experiment --config configs/stage5B1_sequential_X_Xprime_soft_sleep_keyquery.yaml` (with `training.base_lr_scale_during_novel≈0.2`, `masking.key_query.novel_temperature=0.05`, `masking.key_query.novel_entropy_weight=0.5`, `masking.key_query.base_regularization=0.1`)
+  - **Results:** With `max_train_samples=32000` and just five sleep epochs, the final accuracies are task1 = 98.98 %, task2 = 96.27 %, task1′ = 97.45 %, task2′ = 99.16 % (error-overlap ≈60–86 %). Task 2 only drops ~0.7 % between novel insertions and recovers fully after the final sleep, while the primes consolidate back into the base prompts with <1 % loss.
+  - **Implementation details:** Let `q_t∈ℝ^d` be the prompt embedding for task t and `K∈ℝ^{C×d}` the column keys. For each bank we compute attention weights
+    \[
+      α_t = \text{softmax}\left(\frac{K q_t}{τ_b}\right), \quad τ_b =
+      \begin{cases}
+        τ_{\text{novel}} \approx 0.05, & t\in \text{novel bank}\\
+        τ_{\text{base}}, & t\in \text{base bank}
+      \end{cases}
+    \]
+    Novel columns therefore receive almost one-hot weights, while base columns remain softer. We add a bank-specific entropy penalty `λ_novel * H(α_t)` to push the novel masks toward δ-functions.
+    - **Margin lock:** once a column `c` repeatedly wins for task t, we store `c` as `owner(t)` and enforce `α_t[c] ≥ α_t[j] + m` for all other columns `j` in the same bank via a hinge loss `λ_margin * max(0, m - (logit_c - logit_j))`.
+    - **Base regularizer:** for any two tasks `t,u` sharing the base bank we penalize positive cosine similarity between their normalized queries,
+      \[
+        L_{\text{base}} = λ_{\text{base}} \cdot \max(0, q_t^\top q_u / (\|q_t\|\|q_u\|)).
+      \]
+      This keeps occupied base keys separated even when the underlying encoder drifts.
+  - **Shared-weight drift control:** during wake training on a novel task we scale the shared encoder/readout learning rate by `base_lr_scale_during_novel` (e.g., 0.2). Formally, the update step becomes `θ ← θ − (η·s) ∇θ L`, where `s` is the scale (0 freezes the base). This keeps base columns close to their previous optimum without slowing the novel column or requiring replay.
+  - **Sleep promotions:** after Task 2 finishes, we trigger sleep immediately (`training.sleep_after: [task2]`) so Task 1/Task 2 are distilled back into the base bank before Task 1′ arrives, then repeat after Task 2′. This staged consolidation plus the controlled LR ensures each novel task learns in isolation, then hands off its column cleanly to the long-term base bank.
